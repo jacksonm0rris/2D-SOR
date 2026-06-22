@@ -1,0 +1,24 @@
+{
+    "description": "Single Gaussian spot that moves horizontally with potential and brightens near a faradaic peak at 0.1 V. Mimics a localized reflectance change on an electrode surface.",
+    "background": 200,
+    "noise_std": 10,
+    "regions": [
+        {
+            "type": "gaussian",
+            "cx": 0.5,
+            "cy": 0.5,
+            "sigma": 0.12,
+            "amplitude": 800,
+            "modulation": {
+                "type": "faradaic",
+                "E_peak": 0.1,
+                "width": 0.02,
+                "baseline": 1.0,
+                "peak_amplitude": 0.3
+            },
+            "movement": {
+                "dx_per_E": 0.8
+            }
+        }
+    ]
+}

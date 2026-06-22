@@ -1,0 +1,23 @@
+# Performing SOR Experiments
+
+## Set up cell
+Works best for cell with flat bottom, no other features inside cell body
+1. Fil cell with electrolyte. Add counter electrode, add reference electrode, insert argon tube into bubbler. Bubble electrolyte for 20 minutes, then pull straw out of solution to fil headspace with argon.
+2. For single crystal Au(111): Insert into holder, flame anneal, insert into argon headspace of cell to cool. Wait 5 minutes. Lower crystal to make contact with elecrolyte surface, then withdraw to make meniscus. Take care not to break the mensicus.
+3. For CVs, attach blue wire to counter electrode, white to reference, red to working electrode. Align with camera, LED.
+
+## Align crystal
+This can be difficult and time consuming. The crystal should be as orthogonal to the LED/camera as possible, with the LED centered on the crystal. Take care to maintain meniscus while adjusting camera - if possible, move camera rather than electrode holder/cell.
+1. Make sure stand hoder is tight on the stand and platform opening is positioned over the camera lens. 
+2. Launch Thorlabs Upseries software. Turn on LED.
+3. Launch ThorCam software. Select the camera from dropdown menu. Click "Start Capture" button in upper left-hand corner tobegin capturing images. Open "settings" menu and select "Autoexposure" checkbox.
+4. Place cell on stand holder. Take care that the holder doesn't fall onto camera or tip cell off stand. Adjust cell, camera, stand until crystal looks like it's fully illuminated by LED. Adjust focus and zoom on camera to bring crystal into focus. Adjust camera position until LED is centered and the crystal surface appears orthogonal to camera and in sharp focus - this might take a while!
+5. Adjust exposure ThorCam until the crystal has close to uniform lighting. Record exposure (ms).
+
+## Take CV
+1. Launch sor_demo. Click "Setup..." Enter CV parameters. Select "Camera" tab. In "Exp us", enter the recorded exposure value from ThorCamin us (remove decimal from ms value).
+2. Make sure EC-Lab, ThorCam programs are closed. On main scren, click "Run" button. Select location to save file, then click "Save".
+3. The program will perform a CV and capture images. When finished, unless performing analysis on the trial, go to the save location and change the name of the "frames_f23.bin" file. This file stores the photographs recorded during the CV, and is overwritten every new trial.
+
+## Analyse Data
+

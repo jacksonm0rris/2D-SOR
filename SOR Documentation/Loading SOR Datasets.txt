@@ -1,0 +1,21 @@
+Loading SOR Datasets
+
+1.) Go to C:\Users\ocecr\AppData\Local\Temp
+2.) Each test added to folder beginning "sor_" followed by some alphanumeric code e.g "sor_oi9nbx9_"
+3.) Copy/cut folder and move to wherever's a better storage place
+4.) Start SOR_demo.py
+5.) Click "Load Dataset"
+6.) Find and select folder containing .json and .bin files from the sor_ folder
+NOTE: If you open the folder, it'll look empty -if the folder has the .json and .bin files, that's all you need!
+7.) Wait for everything to load, then you can do data stuff on it
+
+## Update for sor_demo_v14_26-5-13.py
+
+Each run generates a frames_f32.bin file with the camera images from that run. If a new run is performed, that file is overwritten. To prevent camera images from being lost, rename the frames_f32.bin file to something else before performing a new run.
+
+To load a dataset:
+1.) Change .bin filename to frames_f32.bin. Ensure .bin file in same location as .json dataset.
+2.) Launch 2D-SOR demo
+3.) Click "Load Dataset..."
+4.) Navigate to dataset .json file
+ 

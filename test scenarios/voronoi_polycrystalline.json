@@ -1,0 +1,46 @@
+{
+    "description": "Voronoi polycrystalline electrode — 15 irregular grains with hard edges, 5 distinct electrochemical behavior types. Resembles a real polycrystalline surface viewed under SOR. Use Analysis with K=6 (5 grain types + any edge artifacts), PCA=5, zscore.",
+    "background": 160,
+    "noise_std": 4,
+    "regions": [
+        {"_comment": "(111) facet — faradaic dip at 0.08 V, 4 grains",
+         "type": "voronoi", "cx": 0.15, "cy": 0.25, "amplitude": 300,
+         "modulation": {"type": "faradaic", "E_peak": 0.08, "width": 0.025, "baseline": 1.4, "peak_amplitude": -0.7}},
+        {"type": "voronoi", "cx": 0.55, "cy": 0.12, "amplitude": 280,
+         "modulation": {"type": "faradaic", "E_peak": 0.08, "width": 0.025, "baseline": 1.4, "peak_amplitude": -0.7}},
+        {"type": "voronoi", "cx": 0.78, "cy": 0.70, "amplitude": 310,
+         "modulation": {"type": "faradaic", "E_peak": 0.08, "width": 0.025, "baseline": 1.4, "peak_amplitude": -0.7}},
+        {"type": "voronoi", "cx": 0.35, "cy": 0.82, "amplitude": 290,
+         "modulation": {"type": "faradaic", "E_peak": 0.08, "width": 0.025, "baseline": 1.4, "peak_amplitude": -0.7}},
+
+        {"_comment": "(110) facet — oxide growth ramp, 3 grains",
+         "type": "voronoi", "cx": 0.42, "cy": 0.38, "amplitude": 350,
+         "modulation": {"type": "ramp", "start": 0.8, "end": 1.8}},
+        {"type": "voronoi", "cx": 0.88, "cy": 0.30, "amplitude": 330,
+         "modulation": {"type": "ramp", "start": 0.8, "end": 1.8}},
+        {"type": "voronoi", "cx": 0.10, "cy": 0.60, "amplitude": 340,
+         "modulation": {"type": "ramp", "start": 0.8, "end": 1.8}},
+
+        {"_comment": "(100) facet — capacitive oscillation, 3 grains",
+         "type": "voronoi", "cx": 0.65, "cy": 0.45, "amplitude": 320,
+         "modulation": {"type": "sine", "frequency": 2.0, "phase": 0.3, "offset": 1.0, "amplitude": 0.45}},
+        {"type": "voronoi", "cx": 0.25, "cy": 0.50, "amplitude": 300,
+         "modulation": {"type": "sine", "frequency": 2.0, "phase": 0.3, "offset": 1.0, "amplitude": 0.45}},
+        {"type": "voronoi", "cx": 0.50, "cy": 0.90, "amplitude": 310,
+         "modulation": {"type": "sine", "frequency": 2.0, "phase": 0.3, "offset": 1.0, "amplitude": 0.45}},
+
+        {"_comment": "(211) facet — step response at 40%, 3 grains",
+         "type": "voronoi", "cx": 0.82, "cy": 0.88, "amplitude": 280,
+         "modulation": {"type": "step", "t_step": 0.4, "before": 0.5, "after": 1.7}},
+        {"type": "voronoi", "cx": 0.30, "cy": 0.15, "amplitude": 270,
+         "modulation": {"type": "step", "t_step": 0.4, "before": 0.5, "after": 1.7}},
+        {"type": "voronoi", "cx": 0.92, "cy": 0.52, "amplitude": 260,
+         "modulation": {"type": "step", "t_step": 0.4, "before": 0.5, "after": 1.7}},
+
+        {"_comment": "Reactive inclusion — faradaic peak at different potential (0.20 V), 2 small grains",
+         "type": "voronoi", "cx": 0.48, "cy": 0.62, "amplitude": 500,
+         "modulation": {"type": "faradaic", "E_peak": 0.20, "width": 0.015, "baseline": 1.0, "peak_amplitude": 0.9}},
+        {"type": "voronoi", "cx": 0.70, "cy": 0.18, "amplitude": 480,
+         "modulation": {"type": "faradaic", "E_peak": 0.20, "width": 0.015, "baseline": 1.0, "peak_amplitude": 0.9}}
+    ]
+}

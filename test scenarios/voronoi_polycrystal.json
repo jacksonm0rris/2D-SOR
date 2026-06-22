@@ -1,0 +1,54 @@
+{
+    "description": "Polycrystalline electrode via Voronoi tessellation. 12 grains with hard irregular edges and 6 distinct behaviors. Use K=7 (6 types + edge effects), zscore, PCA=5.",
+    "background": 120,
+    "noise_std": 5,
+    "regions": [
+        {"_comment": "(111) grain — faradaic dip at 0.08V",
+         "type": "voronoi", "cx": 0.15, "cy": 0.20, "amplitude": 300,
+         "modulation": {"type": "faradaic", "E_peak": 0.08, "width": 0.025, "baseline": 1.3, "peak_amplitude": -0.6}},
+
+        {"_comment": "(111) grain",
+         "type": "voronoi", "cx": 0.70, "cy": 0.15, "amplitude": 280,
+         "modulation": {"type": "faradaic", "E_peak": 0.08, "width": 0.025, "baseline": 1.3, "peak_amplitude": -0.6}},
+
+        {"_comment": "(111) grain",
+         "type": "voronoi", "cx": 0.45, "cy": 0.80, "amplitude": 310,
+         "modulation": {"type": "faradaic", "E_peak": 0.08, "width": 0.025, "baseline": 1.3, "peak_amplitude": -0.6}},
+
+        {"_comment": "(110) grain — oxide ramp",
+         "type": "voronoi", "cx": 0.80, "cy": 0.55, "amplitude": 350,
+         "modulation": {"type": "ramp", "start": 0.8, "end": 1.8}},
+
+        {"_comment": "(110) grain",
+         "type": "voronoi", "cx": 0.25, "cy": 0.65, "amplitude": 330,
+         "modulation": {"type": "ramp", "start": 0.8, "end": 1.8}},
+
+        {"_comment": "(100) grain — capacitive oscillation",
+         "type": "voronoi", "cx": 0.50, "cy": 0.40, "amplitude": 400,
+         "modulation": {"type": "sine", "frequency": 2.0, "phase": 0.3, "offset": 1.0, "amplitude": 0.4}},
+
+        {"_comment": "(100) grain",
+         "type": "voronoi", "cx": 0.85, "cy": 0.85, "amplitude": 380,
+         "modulation": {"type": "sine", "frequency": 2.0, "phase": 0.3, "offset": 1.0, "amplitude": 0.4}},
+
+        {"_comment": "(100) grain",
+         "type": "voronoi", "cx": 0.10, "cy": 0.90, "amplitude": 370,
+         "modulation": {"type": "sine", "frequency": 2.0, "phase": 0.3, "offset": 1.0, "amplitude": 0.4}},
+
+        {"_comment": "High-index grain — step at 35%",
+         "type": "voronoi", "cx": 0.35, "cy": 0.25, "amplitude": 450,
+         "modulation": {"type": "step", "t_step": 0.35, "before": 0.5, "after": 1.8}},
+
+        {"_comment": "High-index grain",
+         "type": "voronoi", "cx": 0.60, "cy": 0.65, "amplitude": 420,
+         "modulation": {"type": "step", "t_step": 0.35, "before": 0.5, "after": 1.8}},
+
+        {"_comment": "Inclusion — faradaic at 0.18V",
+         "type": "voronoi", "cx": 0.40, "cy": 0.55, "amplitude": 500,
+         "modulation": {"type": "faradaic", "E_peak": 0.18, "width": 0.015, "baseline": 1.0, "peak_amplitude": 0.9}},
+
+        {"_comment": "Passive grain — nearly constant",
+         "type": "voronoi", "cx": 0.90, "cy": 0.30, "amplitude": 250,
+         "modulation": {"type": "ramp", "start": 1.0, "end": 1.05}}
+    ]
+}

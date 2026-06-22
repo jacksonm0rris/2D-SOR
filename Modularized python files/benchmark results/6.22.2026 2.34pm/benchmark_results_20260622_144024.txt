@@ -1,0 +1,22 @@
+2D-SOR benchmark suite
+Created: 2026-06-22T14:42:31
+Scenarios: 5
+
+Per-scenario results:
+scenario	frames	fps	on_frame_mean_ms	on_frame_p95_ms	analyze_s	peak_mb	error
+cluster_test.json	732	29.306	0.544	0.740	0.408	nan	no
+moving_gaussian.json	731	29.291	0.528	0.703	0.398	nan	no
+polycrystalline.json	731	29.283	0.589	0.776	0.438	nan	no
+voronoi_polycrystal.json	733	29.372	0.520	0.707	0.398	nan	no
+voronoi_polycrystalline.json	733	29.370	0.517	0.650	0.398	nan	no
+
+Suite averages:
+frames_total: 3660
+avg_effective_fps: 29.325
+avg_on_frame_mean_ms: 0.540
+avg_on_frame_p95_ms: 0.715
+avg_on_frame_max_ms: 1.436
+avg_analyze_seconds: 0.408
+avg_peak_memory_mb: nan
+avg_final_memory_mb: nan
+errors: 0

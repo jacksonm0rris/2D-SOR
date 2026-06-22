@@ -1,0 +1,54 @@
+{
+    "description": "Simulated polycrystalline electrode surface. Multiple overlapping regions of varying size and shape represent different crystal grains with distinct electrochemical reflectance responses. Grain boundaries and defect sites have unique temporal signatures. Use PCA with zscore normalization, N=5. K-means with K=6-8 also works well.",
+    "background": 180,
+    "noise_std": 5,
+    "regions": [
+        {"_comment": "Large (111) grain — center-left, strong faradaic dip",
+         "type": "gaussian", "cx": 0.30, "cy": 0.40, "sigma": 0.15, "amplitude": 400,
+         "modulation": {"type": "faradaic", "E_peak": 0.08, "width": 0.025, "baseline": 1.3, "peak_amplitude": -0.6}},
+
+        {"_comment": "(111) grain — upper right, same behavior different location",
+         "type": "gaussian", "cx": 0.72, "cy": 0.22, "sigma": 0.10, "amplitude": 350,
+         "modulation": {"type": "faradaic", "E_peak": 0.08, "width": 0.025, "baseline": 1.3, "peak_amplitude": -0.6}},
+
+        {"_comment": "(110) grain — right side, oxide growth ramp",
+         "type": "gaussian", "cx": 0.75, "cy": 0.60, "sigma": 0.12, "amplitude": 450,
+         "modulation": {"type": "ramp", "start": 0.9, "end": 1.7}},
+
+        {"_comment": "(110) grain — bottom-left, same oxide ramp",
+         "type": "gaussian", "cx": 0.20, "cy": 0.78, "sigma": 0.09, "amplitude": 380,
+         "modulation": {"type": "ramp", "start": 0.9, "end": 1.7}},
+
+        {"_comment": "(100) grain — center, capacitive oscillation",
+         "type": "gaussian", "cx": 0.50, "cy": 0.50, "sigma": 0.13, "amplitude": 500,
+         "modulation": {"type": "sine", "frequency": 2.0, "phase": 0.5, "offset": 1.0, "amplitude": 0.35}},
+
+        {"_comment": "(100) grain — top-left, same capacitive",
+         "type": "gaussian", "cx": 0.18, "cy": 0.15, "sigma": 0.08, "amplitude": 420,
+         "modulation": {"type": "sine", "frequency": 2.0, "phase": 0.5, "offset": 1.0, "amplitude": 0.35}},
+
+        {"_comment": "Grain boundary defect — narrow, sharp step response",
+         "type": "gaussian", "cx": 0.42, "cy": 0.30, "sigma": 0.03, "amplitude": 700,
+         "modulation": {"type": "step", "t_step": 0.35, "before": 0.6, "after": 2.0}},
+
+        {"_comment": "Grain boundary — between center and right grains",
+         "type": "gaussian", "cx": 0.62, "cy": 0.45, "sigma": 0.025, "amplitude": 650,
+         "modulation": {"type": "step", "t_step": 0.35, "before": 0.6, "after": 2.0}},
+
+        {"_comment": "Grain boundary — lower region",
+         "type": "gaussian", "cx": 0.45, "cy": 0.68, "sigma": 0.03, "amplitude": 600,
+         "modulation": {"type": "step", "t_step": 0.35, "before": 0.6, "after": 2.0}},
+
+        {"_comment": "Inclusion / defect site — small, bright, faradaic at different potential",
+         "type": "gaussian", "cx": 0.55, "cy": 0.25, "sigma": 0.02, "amplitude": 900,
+         "modulation": {"type": "faradaic", "E_peak": 0.18, "width": 0.015, "baseline": 1.0, "peak_amplitude": 0.8}},
+
+        {"_comment": "Second inclusion",
+         "type": "gaussian", "cx": 0.35, "cy": 0.60, "sigma": 0.02, "amplitude": 850,
+         "modulation": {"type": "faradaic", "E_peak": 0.18, "width": 0.015, "baseline": 1.0, "peak_amplitude": 0.8}},
+
+        {"_comment": "Broad diffuse oxide layer — covers most of surface, slow ramp",
+         "type": "rect", "x0": 0.05, "y0": 0.05, "x1": 0.95, "y1": 0.95, "amplitude": 80,
+         "modulation": {"type": "ramp", "start": 1.0, "end": 1.15}}
+    ]
+}
