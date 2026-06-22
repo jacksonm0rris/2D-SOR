@@ -231,6 +231,7 @@ class ExportMixin:
 
     def closeEvent(self,event):
         if self._worker and self._worker.isRunning():self._worker.request_stop();self._worker.wait(3000)
+        self._stop_frame_processor()
         self._memmap=None
         d=self.cfg["display"];d["colormap"]=self.cmap_cb.currentText()
         d["auto_levels"]=str(self.auto_lev.isChecked()).lower()

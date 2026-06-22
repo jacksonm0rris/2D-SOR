@@ -29,6 +29,8 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
         self._zone_mask_cache={}
         self._memmap=None;self._store_dir=None
         self._live_ftw=[];self._live_fpwr=[];self._live_roi=[]
+        self._frame_processor=None;self._frame_processor_generation=0
+        self._live_processed_n=0
         self._ref_frame=None;self._ref_roi_val=None;self._last_frame=None
         self._running=False;self._worker=None
         self._last_save_dir=os.path.expanduser("~")
@@ -50,8 +52,8 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
         self._cl_curves_t={};self._cl_curves_e={};self._cl_means=None
         self._power_win=None
         self._cv_last_draw=0.0
-        self._live_ftw_arr=np.empty(8192,dtype=np.float64)
-        self._live_roi_arr=np.empty(8192,dtype=np.float64)
+        self._live_ftw_arr=np.full(8192,np.nan,dtype=np.float64)
+        self._live_roi_arr=np.full(8192,np.nan,dtype=np.float64)
         self._lowess_color=QtGui.QColor(60,220,100)
         self._build_ui();self._apply_cmap()
         self._zones=[self.roi]

@@ -7,9 +7,96 @@ from .workers import *
 from .datasets import *
 from .dialogs import *
 
+import queue as _queue
+
+
+class _LiveFrameProcessor(QtCore.QThread):
+    result_ready=QtCore.pyqtSignal(object)
+
+    def __init__(self,max_queue=4,parent=None):
+        super().__init__(parent)
+        self._queue=_queue.Queue(maxsize=max(1,int(max_queue)))
+        self._stop_evt=threading.Event()
+        self._dropped_frames=0
+
+    def submit(self,payload):
+        if self._stop_evt.is_set():return
+        try:
+            self._queue.put_nowait(payload)
+        except _queue.Full:
+            try:self._queue.get_nowait()
+            except _queue.Empty:pass
+            else:self._dropped_frames+=1
+            try:self._queue.put_nowait(payload)
+            except _queue.Full:pass
+
+    def request_stop(self):
+        self._stop_evt.set()
+        try:self._queue.put_nowait(None)
+        except _queue.Full:pass
+
+    def run(self):
+        while not self._stop_evt.is_set():
+            try:payload=self._queue.get(timeout=0.05)
+            except _queue.Empty:continue
+            if payload is None:break
+            try:
+                t0=time.perf_counter()
+                frame=np.asarray(payload["frame"])
+                frame_flat=frame.ravel()
+                rv=0.0
+                for mask in payload["masks"]:
+                    rv+=float(np.nansum(frame_flat[mask]))
+                elapsed_ms=(time.perf_counter()-t0)*1000.0
+                self.result_ready.emit({
+                    "frame_idx":payload["frame_idx"],
+                    "t_wall":payload["t_wall"],
+                    "power":payload["power"],
+                    "roi":rv,
+                    "generation":payload["generation"],
+                    "worker_frame_ms":elapsed_ms,
+                    "worker_queue_dropped_frames":self._dropped_frames,
+                })
+            except Exception as e:
+                self.result_ready.emit({
+                    "frame_idx":payload.get("frame_idx",-1),
+                    "t_wall":payload.get("t_wall",np.nan),
+                    "power":payload.get("power",np.nan),
+                    "roi":np.nan,
+                    "generation":payload.get("generation",-1),
+                    "worker_frame_ms":np.nan,
+                    "worker_queue_dropped_frames":self._dropped_frames,
+                    "error":str(e),
+                })
+
 
 class AcquisitionMixin:
+    def _start_frame_processor(self):
+        self._stop_frame_processor()
+        self._frame_processor=_LiveFrameProcessor(max_queue=4,parent=self)
+        self._frame_processor.result_ready.connect(
+            self._on_frame_processed,QtCore.Qt.ConnectionType.QueuedConnection)
+        self._frame_processor.start()
+
+    def _stop_frame_processor(self):
+        proc=getattr(self,"_frame_processor",None)
+        if proc is not None:
+            proc.request_stop()
+            proc.wait(1000)
+            self._frame_processor=None
+
+    def _ensure_live_capacity(self,n):
+        if n<=self._live_ftw_arr.size:return
+        new_size=max(n,self._live_ftw_arr.size*2)
+        ftw=np.full(new_size,np.nan,dtype=np.float64)
+        roi=np.full(new_size,np.nan,dtype=np.float64)
+        ftw[:self._live_ftw_arr.size]=self._live_ftw_arr
+        roi[:self._live_roi_arr.size]=self._live_roi_arr
+        self._live_ftw_arr=ftw;self._live_roi_arr=roi
+
     def _clear_data(self):
+        self._stop_frame_processor()
+        self._frame_processor_generation+=1
         for a in ["_E_all","_I_all","_t_all","_t_wall_echem","_frame_E","_frame_I","_frame_t","_frame_t_wall","_frame_power","_roi_intensity","_drr_intensity"]:
             setattr(self,a,np.array([],dtype=np.float64))
         self._roi_cache_key=None;self._live_ftw=[];self._live_fpwr=[];self._live_roi=[]
@@ -21,8 +108,9 @@ class AcquisitionMixin:
         self._I_cv=np.array([],dtype=np.float64)
         self._t_cv=np.array([],dtype=np.float64)
         self._tw_cv=np.array([],dtype=np.float64)
-        self._live_ftw_arr=np.empty(8192,dtype=np.float64)
-        self._live_roi_arr=np.empty(8192,dtype=np.float64)
+        self._live_ftw_arr=np.full(8192,np.nan,dtype=np.float64)
+        self._live_roi_arr=np.full(8192,np.nan,dtype=np.float64)
+        self._live_processed_n=0
         self._cv_last_draw=0.0
         self._frames_path=None;self._frames_hw=None;self._n_frames=0;self._memmap=None
         self._ref_frame=None;self._ref_roi_val=None;self._last_frame=None
@@ -73,6 +161,7 @@ class AcquisitionMixin:
         json_stem=os.path.splitext(os.path.basename(json_path))[0]
         bin_path=os.path.join(save_dir,json_stem+"_frames.bin")
         self._clear_data();self._running=True;self._set_btns(True);self.traffic.setState(TrafficLight.RED)
+        self._start_frame_processor()
         self.status_lbl.setText(f"Starting {exp}...");self.prog_lbl.setText("")
         self._store_dir=save_dir
         if exp==EXP_CVA:
@@ -89,6 +178,7 @@ class AcquisitionMixin:
             p,_=QtWidgets.QFileDialog.getOpenFileName(self,"Scenario",sd if os.path.isdir(sd) else "","JSON (*.json);;All (*)")
             sp=p if p else None
         self._clear_data();self._running=True;self._set_btns(True);self.traffic.setState(TrafficLight.RED)
+        self._start_frame_processor()
         self.status_lbl.setText("Test...");self.prog_lbl.setText("")
         self._store_dir=tempfile.mkdtemp(prefix="sor_test_")
         import datetime as _dt
@@ -111,6 +201,7 @@ class AcquisitionMixin:
         self.btn_stop.setEnabled(False)
 
     def _on_done(self,ds):
+        self._stop_frame_processor()
         self._running=False;self._worker=None;self._set_btns(False)
         self.traffic.setState(TrafficLight.YELLOW)
         QtWidgets.QApplication.processEvents()
@@ -143,6 +234,7 @@ class AcquisitionMixin:
         self.traffic.setState(TrafficLight.GREEN)
 
     def _on_err(self,msg):
+        self._stop_frame_processor()
         self._running=False;self._worker=None;self._set_btns(False);self.traffic.setState(TrafficLight.GREEN)
         self.status_lbl.setText("Error.");QtWidgets.QMessageBox.warning(self,"Error",msg[:1000])
 
@@ -250,22 +342,46 @@ class AcquisitionMixin:
         self._last_frame=frame;self._n_frames=fidx+1
         if self._frames_hw is None:self._frames_hw=frame.shape[:2]
         self._live_ftw.append(tw);self._live_fpwr.append(pwr)
-        rv=0.0
-        frame_flat=frame.ravel()
-        for _pmask in self._get_zone_mask_flats(frame.shape[:2]):
-            rv+=float(np.nansum(frame_flat[_pmask]))
         n=fidx+1
-        if n>self._live_ftw_arr.size:
-            self._live_ftw_arr=np.resize(self._live_ftw_arr,n*2)
-            self._live_roi_arr=np.resize(self._live_roi_arr,n*2)
-        self._live_ftw_arr[fidx]=tw;self._live_roi_arr[fidx]=rv
+        self._ensure_live_capacity(n)
         self.fslider.setRange(0,max(0,fidx));self.fslider.setValue(fidx)
         self.fslider_lbl.setText(f"{fidx}/{fidx}")
-        fa=self._live_ftw_arr[:n];ra=self._live_roi_arr[:n]
+        masks=tuple(self._get_zone_mask_flats(frame.shape[:2]))
+        proc=getattr(self,"_frame_processor",None)
+        if proc is not None and proc.isRunning():
+            proc.submit({
+                "frame":frame,
+                "masks":masks,
+                "frame_idx":fidx,
+                "t_wall":tw,
+                "power":pwr,
+                "generation":self._frame_processor_generation,
+            })
+        else:
+            rv=0.0;frame_flat=frame.ravel()
+            for _pmask in masks:rv+=float(np.nansum(frame_flat[_pmask]))
+            self._on_frame_processed({
+                "frame_idx":fidx,"t_wall":tw,"power":pwr,"roi":rv,
+                "generation":self._frame_processor_generation,
+                "worker_frame_ms":np.nan,
+                "worker_queue_dropped_frames":0})
+
+    def _on_frame_processed(self,data):
+        if data.get("generation")!=self._frame_processor_generation:return
+        fidx=int(data.get("frame_idx",-1))
+        if fidx<0:return
+        n=fidx+1
+        self._ensure_live_capacity(n)
+        self._live_ftw_arr[fidx]=float(data.get("t_wall",np.nan))
+        self._live_roi_arr[fidx]=float(data.get("roi",np.nan))
+        self._live_processed_n=max(self._live_processed_n,n)
+        fa=self._live_ftw_arr[:self._live_processed_n]
+        ra=self._live_roi_arr[:self._live_processed_n]
+        if fa.size==0 or not np.isfinite(fa[0]):return
         te=fa-fa[0]
         MAX_LIVE=2000
-        if n>MAX_LIVE:
-            idx=np.round(np.linspace(0,n-1,MAX_LIVE)).astype(int)
+        if self._live_processed_n>MAX_LIVE:
+            idx=np.round(np.linspace(0,self._live_processed_n-1,MAX_LIVE)).astype(int)
             te_d=te[idx];ra_d=ra[idx]
         else:
             te_d=te;ra_d=ra

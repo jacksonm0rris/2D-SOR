@@ -46,9 +46,17 @@ def _process_memory_mb():
 
     counters = PROCESS_MEMORY_COUNTERS()
     counters.cb = ctypes.sizeof(counters)
-    handle = ctypes.windll.kernel32.GetCurrentProcess()
-    ok = ctypes.windll.psapi.GetProcessMemoryInfo(
-        handle, ctypes.byref(counters), counters.cb)
+    kernel32 = ctypes.WinDLL("Kernel32.dll", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    psapi = ctypes.WinDLL("Psapi.dll", use_last_error=True)
+    psapi.GetProcessMemoryInfo.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+        ctypes.c_ulong,
+    ]
+    psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+    handle = kernel32.GetCurrentProcess()
+    ok = psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
     if not ok:
         return math.nan
     return counters.WorkingSetSize / (1024 * 1024)
@@ -95,6 +103,7 @@ class BenchmarkRunner(QtCore.QObject):
         self.current = None
         self.current_temp_dir = None
         self._orig_on_frame = window._on_frame
+        self._orig_on_frame_processed = window._on_frame_processed
         self._orig_on_err = window._on_err
         self._mem_timer = QtCore.QTimer(self)
         self._mem_timer.setInterval(100)
@@ -102,6 +111,7 @@ class BenchmarkRunner(QtCore.QObject):
 
     def start(self):
         self.window._on_frame = self._timed_on_frame
+        self.window._on_frame_processed = self._timed_on_frame_processed
         self.window._on_err = self._window_error
         self._run_next()
 
@@ -118,6 +128,8 @@ class BenchmarkRunner(QtCore.QObject):
             "scenario": scenario.name,
             "scenario_path": str(scenario),
             "frame_handler_ms": [],
+            "worker_frame_ms": [],
+            "worker_queue_dropped_frames": [],
             "frame_interval_ms": [],
             "memory_samples_mb": [],
             "frames": 0,
@@ -126,6 +138,7 @@ class BenchmarkRunner(QtCore.QObject):
         }
 
         self.window._clear_data()
+        self.window._start_frame_processor()
         self.window._running = True
         self.window._set_btns(True)
         self.window.traffic.setState(TrafficLight.RED)
@@ -162,6 +175,16 @@ class BenchmarkRunner(QtCore.QObject):
         self.current["frame_handler_ms"].append(elapsed_ms)
         self.current["frames"] = max(self.current["frames"],
                                      int(data.get("frame_idx", -1)) + 1)
+
+    def _timed_on_frame_processed(self, data):
+        if self.current is not None:
+            worker_ms = data.get("worker_frame_ms")
+            if worker_ms is not None and math.isfinite(float(worker_ms)):
+                self.current["worker_frame_ms"].append(float(worker_ms))
+            dropped = data.get("worker_queue_dropped_frames")
+            if dropped is not None:
+                self.current["worker_queue_dropped_frames"].append(int(dropped))
+        return self._orig_on_frame_processed(data)
 
     def _worker_finished(self, _ds):
         if self.current is None:
@@ -211,6 +234,8 @@ class BenchmarkRunner(QtCore.QObject):
             return
 
         frame_ms = self.current["frame_handler_ms"]
+        worker_ms = self.current["worker_frame_ms"]
+        dropped_samples = self.current["worker_queue_dropped_frames"]
         intervals = self.current["frame_interval_ms"]
         mem = self.current["memory_samples_mb"]
         frames = int(self.current["frames"])
@@ -226,10 +251,16 @@ class BenchmarkRunner(QtCore.QObject):
             "on_frame_mean_ms": _mean(frame_ms),
             "on_frame_p95_ms": _percentile(frame_ms, 95),
             "on_frame_max_ms": max(frame_ms) if frame_ms else math.nan,
+            "worker_frame_mean_ms": _mean(worker_ms),
+            "worker_frame_p95_ms": _percentile(worker_ms, 95),
+            "worker_frame_max_ms": max(worker_ms) if worker_ms else math.nan,
+            "worker_queue_dropped_frames": max(dropped_samples)
+            if dropped_samples else 0,
             "frame_interval_mean_ms": _mean(intervals),
             "frame_interval_p95_ms": _percentile(intervals, 95),
             "frame_interval_max_ms": max(intervals) if intervals else math.nan,
             "analyze_seconds": float(self.current.get("analyze_seconds", math.nan)),
+            "memory_sample_count": len(mem),
             "peak_memory_mb": max(mem) if mem else math.nan,
             "final_memory_mb": mem[-1] if mem else math.nan,
             "error": self.current.get("error"),
@@ -247,6 +278,7 @@ class BenchmarkRunner(QtCore.QObject):
 
     def _finish(self):
         self.window._on_frame = self._orig_on_frame
+        self.window._on_frame_processed = self._orig_on_frame_processed
         self.window._on_err = self._orig_on_err
         payload = {
             "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
@@ -269,15 +301,22 @@ class BenchmarkRunner(QtCore.QObject):
             "on_frame_mean_ms",
             "on_frame_p95_ms",
             "on_frame_max_ms",
+            "worker_frame_mean_ms",
+            "worker_frame_p95_ms",
+            "worker_frame_max_ms",
             "frame_interval_mean_ms",
             "frame_interval_p95_ms",
             "frame_interval_max_ms",
             "analyze_seconds",
+            "memory_sample_count",
             "peak_memory_mb",
             "final_memory_mb",
         ]
         summary = {
             "frames_total": sum(int(r["frames"]) for r in self.results),
+            "worker_queue_dropped_frames_total": sum(
+                int(r.get("worker_queue_dropped_frames",0))
+                for r in self.results),
             "errors": len(self.errors),
         }
         for field in numeric_fields:
@@ -295,7 +334,8 @@ class BenchmarkRunner(QtCore.QObject):
             "",
             "Per-scenario results:",
             "scenario\tframes\tfps\ton_frame_mean_ms\ton_frame_p95_ms\t"
-            "analyze_s\tpeak_mb\terror",
+            "worker_mean_ms\tworker_p95_ms\tworker_dropped\tanalyze_s\t"
+            "mem_samples\tpeak_mb\terror",
         ]
         for r in payload["scenarios"]:
             err = "yes" if r.get("error") else "no"
@@ -304,7 +344,11 @@ class BenchmarkRunner(QtCore.QObject):
                 f"{r['effective_fps']:.3f}\t"
                 f"{r['on_frame_mean_ms']:.3f}\t"
                 f"{r['on_frame_p95_ms']:.3f}\t"
+                f"{r['worker_frame_mean_ms']:.3f}\t"
+                f"{r['worker_frame_p95_ms']:.3f}\t"
+                f"{r['worker_queue_dropped_frames']}\t"
                 f"{r['analyze_seconds']:.3f}\t"
+                f"{r['memory_sample_count']}\t"
                 f"{r['peak_memory_mb']:.1f}\t{err}"
             )
         s = payload["summary"]
@@ -316,7 +360,13 @@ class BenchmarkRunner(QtCore.QObject):
             f"avg_on_frame_mean_ms: {s['avg_on_frame_mean_ms']:.3f}",
             f"avg_on_frame_p95_ms: {s['avg_on_frame_p95_ms']:.3f}",
             f"avg_on_frame_max_ms: {s['avg_on_frame_max_ms']:.3f}",
+            f"avg_worker_frame_mean_ms: {s['avg_worker_frame_mean_ms']:.3f}",
+            f"avg_worker_frame_p95_ms: {s['avg_worker_frame_p95_ms']:.3f}",
+            f"avg_worker_frame_max_ms: {s['avg_worker_frame_max_ms']:.3f}",
+            f"worker_queue_dropped_frames_total: "
+            f"{s['worker_queue_dropped_frames_total']}",
             f"avg_analyze_seconds: {s['avg_analyze_seconds']:.3f}",
+            f"avg_memory_sample_count: {s['avg_memory_sample_count']:.1f}",
             f"avg_peak_memory_mb: {s['avg_peak_memory_mb']:.1f}",
             f"avg_final_memory_mb: {s['avg_final_memory_mb']:.1f}",
             f"errors: {s['errors']}",
