@@ -81,11 +81,17 @@ class CVPlotMixin:
         return selected is None or selected==z_idx
 
     def _zone_lowess_pen(self,z_idx):
-        # A selected single ROI gets the global LOWESS style; "All" keeps each
-        # trend line near its ROI color so traces remain distinguishable.
-        if self._selected_lowess_zone()==z_idx:
-            return self._lowess_pen()
+        # A selected single ROI keeps the ROI hue but brightens it so the
+        # smoothed line reads as related to, but distinct from, the raw trace.
+        # "All" keeps faint dotted ROI-color lines so traces remain separable.
         r,g,b=self._zone_color(z_idx)
+        if self._selected_lowess_zone()==z_idx:
+            w=getattr(self,'lowess_thickness',None)
+            thickness=w.value() if w else 2
+            br=int(min(255,r+(255-r)*0.35))
+            bg=int(min(255,g+(255-g)*0.35))
+            bb=int(min(255,b+(255-b)*0.35))
+            return pg.mkPen(color=(br,bg,bb),width=thickness)
         return pg.mkPen(color=(r,g,b,180),width=1,
                         style=QtCore.Qt.PenStyle.DotLine)
 
@@ -118,6 +124,28 @@ class CVPlotMixin:
         # Cycle detection needs the configured upper CV vertex.
         try:return float(self.cfg["potentiostat"].get("upper_v","0.25"))
         except:return None
+
+    def _potential_plot_start(self,E):
+        # Potential-axis plots are not meaningful during the initial hold: many
+        # points share almost the same voltage, so they draw a vertical smear at
+        # the starting potential. Find where the voltage first starts changing
+        # and use that as the first plotted sample for E-axis graphs.
+        E=np.asarray(E,dtype=np.float64)
+        if E.size<3:return 0
+        finite=E[np.isfinite(E)]
+        if finite.size<3:return 0
+        cv_range=float(np.nanmax(finite)-np.nanmin(finite))
+        flat_thresh=max(cv_range*0.02,1e-6)
+        dE_abs=np.abs(np.diff(E))
+        valid=np.isfinite(dE_abs)
+        movers=np.where(valid & (dE_abs>flat_thresh))[0]
+        return min(int(movers[0])+1,E.size-1) if movers.size else 0
+
+    def _trim_range_after_initial_hold(self,s,e,E=None):
+        # Clip one plotted frame range so E-axis views begin after the initial
+        # hold, while preserving the original arrays for time plots and export.
+        start=self._potential_plot_start(self._frame_E if E is None else E)
+        return max(int(s),start),int(e)
 
     def _plot_var_label(self,name):
         # Turn compact dropdown names into labels that make plot titles clearer.
@@ -262,6 +290,8 @@ class CVPlotMixin:
                     _cv_ranges=[(_ci+1,)+_all_cv_cyc[_ci]] if 0<=_ci<len(_all_cv_cyc) else []
                 else:
                     _cv_ranges=[(1,0,min(self._frame_E.size,yv.size))]
+                _cv_ranges=[(cyc_i,)+self._trim_range_after_initial_hold(cs,ce)
+                            for cyc_i,cs,ce in _cv_ranges]
                 if not _cv_ranges:
                     self.cv_curve.setData([],[]);self.cv_smooth.setData([],[])
                 for cyc_i,cs,ce in _cv_ranges:
@@ -287,7 +317,8 @@ class CVPlotMixin:
                 else:xdata=self._E_all;ydata=self._I_all
                 n=min(xdata.size,ydata.size)
                 if n>0:
-                    xr,yr=self._break_at_steps(xdata[:n],ydata[:n])
+                    s,_=self._trim_range_after_initial_hold(0,n,xdata[:n])
+                    xr,yr=self._break_at_steps(xdata[s:n],ydata[s:n])
                     if xr.size>MAX_CV:
                         idx=np.round(np.linspace(0,xr.size-1,MAX_CV)).astype(int)
                         xr=xr[idx];yr=yr[idx]
@@ -322,8 +353,9 @@ class CVPlotMixin:
             self.cv_plot.setLabel("bottom", "Potential (V)")
             self.cv_plot.setLabel("left", "Current (A)")
             self.cv_plot.setTitle("Current vs Potential")
-            xdata = E
-            ydata = I
+            s=self._potential_plot_start(E)
+            xdata = E[s:]
+            ydata = I[s:]
         else:
             self.cv_plot.setLabel("bottom", "Time (s)")
             self.cv_plot.setLabel("left", "Potential (V)")
@@ -564,6 +596,9 @@ class CVPlotMixin:
             _cyc_ranges=[(_ci+1,)+_all_cycles[_ci]] if 0<=_ci<len(_all_cycles) else []
         else:
             _cyc_ranges=[(1,0,min(re_base.size,self._frame_E.size,self._frame_t.size))]
+        if _e_axis_is_E:
+            _cyc_ranges=[(cyc_i,)+self._trim_range_after_initial_hold(cs,ce)
+                         for cyc_i,cs,ce in _cyc_ranges]
         if not hasattr(self,"_roi_e_cyc_curves"):self._roi_e_cyc_curves=[]
         if not hasattr(self,"_roi_e_cyc_lowess"):self._roi_e_cyc_lowess=[]
         for c in self._roi_e_cyc_curves:self.roi_e_plot.removeItem(c)

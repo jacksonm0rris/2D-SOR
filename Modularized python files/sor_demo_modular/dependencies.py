@@ -4,7 +4,7 @@
 Supports CV (Cyclic Voltammetry) and CVA (CV Advanced) via easy-biologic.
 Experiment type and hold times configured in Setup dialog.
 """
-import sys,os,platform,time,traceback,tempfile,configparser,zipfile,io,json,argparse,threading
+import sys,os,platform,time,traceback,tempfile,configparser,zipfile,io,json,argparse,threading,shutil
 import numpy as np
 from PyQt6 import QtWidgets,QtCore,QtGui
 import pyqtgraph as pg

@@ -8,15 +8,15 @@ from .dependencies import *
 from .settings import *
 
 class SetupDialog(QtWidgets.QDialog):
-    """Dialog for potentiostat, camera, display, power, and reference settings."""
+    """Dialog for potentiostat, camera, power, and reference settings."""
 
     def __init__(self,cfg,parent=None):
         super().__init__(parent);self.setWindowTitle("Setup");self.setMinimumWidth(520);self.cfg=cfg
         self._build();self._load_cfg();self._on_exp_radio()
 
     def _build(self):
-        # The dialog is organized into tabs so experiment, camera, and display
-        # settings are not all mixed together.
+        # The dialog is organized into tabs so experiment and camera settings
+        # are not all mixed together.
         lo=QtWidgets.QVBoxLayout(self);tabs=QtWidgets.QTabWidget();lo.addWidget(tabs)
 
         # Potentiostat tab: connection, waveform, holds, and instrument ranges.
@@ -100,6 +100,14 @@ class SetupDialog(QtWidgets.QDialog):
         self.cb_=QtWidgets.QComboBox();self.cb_.addItems(["1","2","4","8","16"]);cg.addWidget(self.cb_,r,1);r+=1
         cg.addWidget(QtWidgets.QLabel("Bin mode"),r,0)
         self.cbm=QtWidgets.QComboBox();self.cbm.addItems(["mean","sum"]);cg.addWidget(self.cbm,r,1);r+=1
+        cg.addWidget(QtWidgets.QLabel("Raw frame storage"),r,0)
+        self.frame_dtype=QtWidgets.QComboBox()
+        self.frame_dtype.addItems(["uint16","auto","float32"])
+        self.frame_dtype.setToolTip(
+            "uint16: preferred raw camera storage; falls back to float32 only when unsafe.\n"
+            "auto: use uint16 for integer frames that fit, otherwise float32.\n"
+            "float32: legacy format, largest files.")
+        cg.addWidget(self.frame_dtype,r,1);r+=1
         pmg=QtWidgets.QGroupBox("Power Meter");pml=QtWidgets.QGridLayout(pmg)
         self.pm_en=QtWidgets.QCheckBox("Enable");pml.addWidget(self.pm_en,0,0,1,2)
         pml.addWidget(QtWidgets.QLabel("VISA"),1,0);self.pm_v=QtWidgets.QLineEdit();pml.addWidget(self.pm_v,1,1)
@@ -109,17 +117,6 @@ class SetupDialog(QtWidgets.QDialog):
         rfl.addWidget(QtWidgets.QLabel("Idx"),1,0)
         self.rf_i=QtWidgets.QSpinBox();self.rf_i.setRange(0,10000000);rfl.addWidget(self.rf_i,1,1)
         cg.addWidget(rfg,r,0,1,2);tabs.addTab(cw,"Camera")
-
-        dw=QtWidgets.QWidget();dg=QtWidgets.QGridLayout(dw);r=0
-        # Display tab: image colormap and intensity level defaults.
-        dg.addWidget(QtWidgets.QLabel("Cmap"),r,0)
-        self.cmap=QtWidgets.QComboBox()
-        self.cmap.addItems(["gray","viridis","plasma","magma","inferno","cividis","turbo","jet"])
-        dg.addWidget(self.cmap,r,1);r+=1
-        self.al=QtWidgets.QCheckBox("Auto levels");self.al.setChecked(True);dg.addWidget(self.al,r,0,1,2);r+=1
-        self.dlmin=self._dbl(dg,r,"Min",-1e30,1e30,2,0);r+=1
-        self.dlmax=self._dbl(dg,r,"Max",-1e30,1e30,2,1000)
-        tabs.addTab(dw,"Display")
 
         br=QtWidgets.QHBoxLayout()
         b1=QtWidgets.QPushButton("Save && Close");b1.clicked.connect(self._sv);br.addWidget(b1)
@@ -140,7 +137,7 @@ class SetupDialog(QtWidgets.QDialog):
         # Copy saved config values into the widgets. This is the "show current
         # settings" half of the dialog.
         p=self.cfg["potentiostat"];c=self.cfg["camera"]
-        pm=self.cfg["power_meter"];rf=self.cfg["reference"];d=self.cfg["display"]
+        pm=self.cfg["power_meter"];rf=self.cfg["reference"]
         exp=p.get("experiment_type",EXP_CV)
         self.rb_cva.setChecked(exp==EXP_CVA);self.rb_cv.setChecked(exp!=EXP_CVA)
         self.bl_addr.setText(p.get("bl_address","192.168.0.9"))
@@ -164,21 +161,18 @@ class SetupDialog(QtWidgets.QDialog):
         self.cva_ei2.setValue(float(p.get("cva_end_measuring_i","1.0")))
         self.ci.setValue(int(c.get("camera_index","0")));self.ce.setValue(int(c.get("exposure_us","7000")))
         self.cb_.setCurrentText(c.get("bin_factor","1"));self.cbm.setCurrentText(c.get("bin_mode","mean"))
+        self.frame_dtype.setCurrentText(c.get("frame_dtype","uint16"))
         self.cint.setValue(int(c.get("capture_interval_ms","33")));self.cfw.setValue(int(c.get("frame_wait_ms","500")))
         self.pm_en.setChecked(pm.get("enabled","false").lower()=="true");self.pm_v.setText(pm.get("visa",""))
         self.pm_n.setChecked(pm.get("normalize_roi","false").lower()=="true")
         self.rf_en.setChecked(rf.get("normalize_by_ref_frame","false").lower()=="true")
         self.rf_i.setValue(int(rf.get("ref_frame_index","0")))
-        self.cmap.setCurrentText(d.get("colormap","viridis"))
-        self.al.setChecked(d.get("auto_levels","true").lower()=="true")
-        self.dlmin.setValue(float(d.get("level_min","0")))
-        self.dlmax.setValue(float(d.get("level_max","1000")))
 
     def _sv(self):
         # Copy widget values back into the config object, then save to disk.
         # This is the "commit changes" half of the dialog.
         p=self.cfg["potentiostat"];c=self.cfg["camera"]
-        pm=self.cfg["power_meter"];rf=self.cfg["reference"];d=self.cfg["display"]
+        pm=self.cfg["power_meter"];rf=self.cfg["reference"]
         p["experiment_type"]=EXP_CVA if self.rb_cva.isChecked() else EXP_CV
         p["bl_address"]=self.bl_addr.text().strip()
         p["start_v"]=str(self.cv_start.value());p["upper_v"]=str(self.cv_upper.value())
@@ -195,13 +189,12 @@ class SetupDialog(QtWidgets.QDialog):
         p["cva_end_measuring_i"]=str(self.cva_ei2.value())
         c["camera_index"]=str(self.ci.value());c["exposure_us"]=str(self.ce.value())
         c["bin_factor"]=self.cb_.currentText();c["bin_mode"]=self.cbm.currentText()
+        c["frame_dtype"]=self.frame_dtype.currentText()
         c["capture_interval_ms"]=str(self.cint.value());c["frame_wait_ms"]=str(self.cfw.value())
         pm["enabled"]=str(self.pm_en.isChecked()).lower();pm["visa"]=self.pm_v.text().strip()
         pm["normalize_roi"]=str(self.pm_n.isChecked()).lower()
         rf["normalize_by_ref_frame"]=str(self.rf_en.isChecked()).lower()
         rf["ref_frame_index"]=str(self.rf_i.value())
-        d["colormap"]=self.cmap.currentText();d["auto_levels"]=str(self.al.isChecked()).lower()
-        d["level_min"]=str(self.dlmin.value());d["level_max"]=str(self.dlmax.value())
         save_settings(self.cfg);self.accept()
 
     def _tc(self):

@@ -13,22 +13,65 @@ regions whose optical response over time/potential has a similar shape.
 from .dependencies import *
 from .numeric_utils import *
 
-# Writes incoming image frames to a compact raw float32 file so long runs do not
+# Writes incoming image frames to a compact raw binary file so long runs do not
 # need to keep every full-resolution frame in RAM.
 class FrameFileSink:
     """Append-only writer for the camera frame binary file."""
-    def __init__(self,path):
+    def __init__(self,path,dtype="auto",flush_every_frames=60,flush_interval_s=2.0):
         # Track the output file, the first observed frame shape, and frame count.
         self.path=path;self._fh=open(path,"wb");self.shape_hw=None;self.count=0
+        self.requested_dtype=str(dtype or "auto").lower()
+        self.dtype=None
+        self.dtype_name=None
+        self.flush_every_frames=max(1,int(flush_every_frames))
+        self.flush_interval_s=max(0.1,float(flush_interval_s))
+        self._last_flush=time.time()
+
+    def _choose_dtype(self,fr):
+        # Auto mode keeps integer camera frames as uint16 whenever their values
+        # fit. Float inputs remain float32 because converting fractional images
+        # would throw away derived precision.
+        arr=np.asarray(fr)
+        def _fits_u16(a):
+            if not np.issubdtype(a.dtype,np.integer):return False
+            try:return bool(a.size and int(np.nanmin(a))>=0 and int(np.nanmax(a))<=65535)
+            except Exception:return False
+        if self.requested_dtype=="auto":
+            return np.dtype(np.uint16) if _fits_u16(arr) else np.dtype(np.float32)
+        if self.requested_dtype in ("uint16","u2"):
+            if _fits_u16(arr):return np.dtype(np.uint16)
+            return np.dtype(np.float32)
+        return np.dtype(np.float32)
+
+    def _flush_if_needed(self):
+        now=time.time()
+        if self.count%self.flush_every_frames==0 or now-self._last_flush>=self.flush_interval_s:
+            self._fh.flush()
+            self._last_flush=now
+
     def append(self,fr):
         # Accept only 2D frames, enforce a stable shape, and append raw pixels.
         # Shape checks matter because a single binary file can only be reopened
         # correctly if every frame has the same height and width.
-        fr=np.asarray(fr,dtype=np.float32,order="C")
+        if self.dtype is None:
+            self.dtype=self._choose_dtype(fr)
+            self.dtype_name=str(self.dtype)
+        fr=np.asarray(fr,dtype=self.dtype,order="C")
         if fr.ndim!=2:raise ValueError("2D expected")
         if self.shape_hw is None:self.shape_hw=(int(fr.shape[0]),int(fr.shape[1]))
         if (fr.shape[0],fr.shape[1])!=self.shape_hw:raise ValueError("Shape changed")
-        fr.tofile(self._fh);self._fh.flush();self.count+=1
+        try:
+            fr.tofile(self._fh)
+            self.count+=1
+            self._flush_if_needed()
+        except OSError as e:
+            free_msg=""
+            try:
+                du=shutil.disk_usage(os.path.dirname(os.path.abspath(self.path)) or ".")
+                free_msg=f"\nFree space at save location: {du.free/1024**3:.2f} GB"
+            except Exception:pass
+            raise OSError(f"Could not write frame data to {self.path}.{free_msg}\nOriginal error: {e}") from e
+
     def close(self):
         # Best-effort close keeps shutdown robust even if acquisition already failed.
         try:self._fh.flush()
@@ -37,8 +80,9 @@ class FrameFileSink:
         except:pass
     def memmap(self):
         # Reopen the raw frame file as an array without reading it all into memory.
-        if self.shape_hw is None:return np.memmap(self.path,dtype=np.float32,mode="r",shape=(0,1,1))
-        h,w=self.shape_hw;return np.memmap(self.path,dtype=np.float32,mode="r",shape=(self.count,h,w))
+        dtype=self.dtype or np.dtype(np.float32)
+        if self.shape_hw is None:return np.memmap(self.path,dtype=dtype,mode="r",shape=(0,1,1))
+        h,w=self.shape_hw;return np.memmap(self.path,dtype=dtype,mode="r",shape=(self.count,h,w))
 
 
 # Converts a frame stack into spatial blocks, runs PCA on the temporal traces,
@@ -84,15 +128,30 @@ class AnalysisEngine:
 
         def _load_batch(i0,i1):
             # Convert one contiguous frame slice into block-averaged signals.
-            raw=np.asarray(mm[i0:i1],dtype=np.float32)
             if rotate_fn is not None:
                 # Rotation is applied before block averaging so analysis matches
                 # the display orientation and ROI geometry.
+                raw=np.asarray(mm[i0:i1],dtype=np.float32)
                 rotated=[]
                 for k in range(raw.shape[0]):
                     rf=rotate_fn(raw[k])
                     rotated.append(rf)
                 raw=np.stack(rotated,axis=0)
+                raw=raw[:,:self.sp_h*bs,:self.sp_w*bs]
+                # Reshape into blocks: frame, block-row, pixel-row, block-col,
+                # pixel-col. Averaging over the pixel axes gives one signal per
+                # spatial block.
+                return raw.reshape(i1-i0,self.sp_h,bs,self.sp_w,bs).mean(axis=(2,4)).reshape(i1-i0,self.n_sp).T
+            raw=np.asarray(mm[i0:i1])
+            if NUMBA_AVAILABLE and _block_mean_stack_numba is not None:
+                try:
+                    # Numba fuses uint16-to-float conversion and block averaging.
+                    # That avoids making a full float32 copy of every frame chunk.
+                    return _block_mean_stack_numba(np.ascontiguousarray(raw),
+                                                   self.sp_h,self.sp_w,bs)
+                except Exception:
+                    pass
+            raw=np.asarray(raw,dtype=np.float32)
             raw=raw[:,:self.sp_h*bs,:self.sp_w*bs]
             # Reshape into blocks: frame, block-row, pixel-row, block-col,
             # pixel-col. Averaging over the pixel axes gives one signal per

@@ -25,6 +25,21 @@ from .zones_mixin import ZonesMixin
 from .export_mixin import ExportMixin
 
 
+class _ConsoleProxyLabel(QtWidgets.QLabel):
+    """Compatibility label that routes setText calls into the main console."""
+
+    def __init__(self,owner,channel):
+        super().__init__("")
+        self._owner=owner
+        self._channel=channel
+
+    def setText(self,text):
+        super().setText(text)
+        owner=getattr(self,"_owner",None)
+        if owner is not None and hasattr(owner,"_append_console_text"):
+            owner._append_console_text(str(text),self._channel)
+
+
 class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin, ZonesMixin, ExportMixin, QtWidgets.QMainWindow):
     """Main window assembled from focused behavior mixins."""
 
@@ -36,7 +51,7 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
         for a in ["_E_all","_I_all","_t_all","_t_wall_echem","_frame_E","_frame_I","_frame_t","_frame_t_wall","_frame_power","_roi_intensity","_drr_intensity"]:
             setattr(self,a,np.array([],dtype=np.float64))
         # Frame/dataset bookkeeping.
-        self._roi_cache_key=None;self._frames_path=None;self._frames_hw=None;self._n_frames=0
+        self._roi_cache_key=None;self._frames_path=None;self._frames_hw=None;self._frames_dtype="float32";self._n_frames=0
         # Zone/ROI state. Zones are rectangular regions selected on the image.
         self._zones=[]
         self._zone_intensity=[]
@@ -61,14 +76,24 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
             "fps":0.0,
             "roi_ms":np.nan,
             "echem_points":0,
+            "frame_missed_est":0,
+            "echem_missed_est":0,
+            "max_worker_stall_ms":0.0,
             "last_panel_update":0.0,
         }
         self._ref_frame=None;self._ref_roi_val=None;self._last_frame=None
+        self._custom_drr_ref_frame=None
+        self._last_ref_preview_frame=None
+        self._ref_preview_active=False
+        self._ref_preview_worker=None
+        self._ocp_worker=None
+        self._idle_ocp_voltage=np.nan
         self._running=False;self._worker=None
         self._last_save_dir=os.path.expanduser("~")
         self._pending_json_path=None
         self._pending_test_scenario_path=None
         self._pending_test_preview=False
+        self._auto_analyze_on_done=False
         self._plot_axes_locked=False
         # Per-session caches are cleared whenever a new dataset is loaded.
         # ── OPTIMISATION: per-session caches cleared on new data ──────────────
@@ -102,24 +127,121 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
         self._build_ui();self._apply_cmap()
         self._zones=[self.roi]
         scr=QtWidgets.QApplication.primaryScreen()
-        if scr:g=scr.availableGeometry();self.resize(min(1600,g.width()),min(980,g.height()))
-        else:self.resize(1600,980)
+        try:
+            w=max(900,int(self.cfg["display"].get("window_w","1600")))
+            h=max(650,int(self.cfg["display"].get("window_h","980")))
+        except Exception:
+            w,h=1600,980
+        if scr:
+            g=scr.availableGeometry();self.resize(min(w,g.width()),min(h,g.height()))
+        else:self.resize(w,h)
+        QtCore.QTimer.singleShot(0,self._restore_window_layout)
+
+    def _append_console_text(self,text,channel="Status"):
+        # Central log for status/progress text that used to live in the right
+        # sidebar. Empty clears are ignored; fast frame counters are throttled.
+        text=str(text).strip()
+        if not text:return
+        now=time.time()
+        if channel=="Progress" and text.startswith("Echem:"):
+            last_t=getattr(self,"_last_console_progress_t",0.0)
+            if now-last_t<0.5:return
+            self._last_console_progress_t=now
+        key=(channel,text)
+        if getattr(self,"_last_console_entry",None)==key:return
+        self._last_console_entry=key
+        if not hasattr(self,"console_out"):return
+        stamp=time.strftime("%H:%M:%S")
+        self.console_out.appendPlainText(f"[{stamp}] {channel}: {text}")
+        sb=self.console_out.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _splitter_sizes_from_config(self,key,count):
+        # Splitter sizes are stored as "123,456" strings in the display section.
+        # Invalid or stale values are ignored so old settings files still work.
+        try:
+            parts=[int(float(p.strip())) for p in self.cfg["display"].get(key,"").split(",")]
+        except Exception:
+            return None
+        if len(parts)!=count or any(p<=0 for p in parts):return None
+        return parts
+
+    def _restore_window_layout(self):
+        # Restore the user's last graph/control-panel proportions after Qt has
+        # finished laying out the widgets for the current screen size.
+        for attr,key in (
+                ("split_main","split_main"),
+                ("split_rows","split_vertical"),
+                ("split_top","split_top"),
+                ("split_bottom","split_bottom")):
+            sp=getattr(self,attr,None)
+            if sp is None:continue
+            sizes=self._splitter_sizes_from_config(key,sp.count())
+            if sizes is None and key=="split_vertical" and sp.count()==3:
+                sizes=[470,360,110]
+            if sizes:
+                total=sum(sizes)
+                # If a saved pane was squeezed almost closed, reset that row to
+                # an even split so the user is not trapped by old geometry.
+                if key in ("split_top","split_bottom") and total>0 and min(sizes)/total<0.25:
+                    sizes=[1 for _ in sizes]
+                sp.setSizes(sizes)
+
+    def _save_window_layout_to_config(self):
+        # Remember main window size plus all internal graph/control splitters.
+        d=self.cfg["display"]
+        d["window_w"]=str(max(1,self.width()))
+        d["window_h"]=str(max(1,self.height()))
+        for attr,key in (
+                ("split_main","split_main"),
+                ("split_rows","split_vertical"),
+                ("split_top","split_top"),
+                ("split_bottom","split_bottom")):
+            sp=getattr(self,attr,None)
+            if sp is not None:
+                d[key]=",".join(str(max(1,int(v))) for v in sp.sizes())
 
     def _build_ui(self):
         # Overall layout: image and CV plots on top, ROI plots on bottom, control
         # sidebar on the right.
         cw=QtWidgets.QWidget();self.setCentralWidget(cw);mh=QtWidgets.QHBoxLayout(cw);mh.setContentsMargins(4,4,4,4)
-        ps=QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        tr=QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        br=QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        ps.addWidget(tr);ps.addWidget(br)
+        self.split_rows=QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        self.split_top=QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.split_bottom=QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        for sp in (self.split_rows,self.split_top,self.split_bottom):
+            sp.setChildrenCollapsible(False);sp.setHandleWidth(8)
+        self.top_panel=QtWidgets.QWidget()
+        self.top_panel_lay=QtWidgets.QVBoxLayout(self.top_panel)
+        self.top_panel_lay.setContentsMargins(0,0,0,0)
+        self.top_panel_lay.setSpacing(2)
+        self.console_out=QtWidgets.QPlainTextEdit()
+        self.console_out.setReadOnly(True)
+        self.console_out.setMaximumBlockCount(1000)
+        self.console_out.setPlaceholderText("Console output")
+        self.console_out.setStyleSheet(
+            "QPlainTextEdit{font-family:Consolas,monospace;font-size:11px;"
+            "background:#111;color:#ddd;border:1px solid #444;}")
+        self.console_out.setMinimumHeight(70)
+        self.split_rows.addWidget(self.top_panel)
+        self.split_rows.addWidget(self.split_bottom)
+        self.split_rows.addWidget(self.console_out)
+        self.split_rows.setStretchFactor(0,5)
+        self.split_rows.setStretchFactor(1,4)
+        self.split_rows.setStretchFactor(2,1)
         # Image panel: frame slider, display controls, ROI zones, and overlays.
         ic=QtWidgets.QWidget();ivl=QtWidgets.QVBoxLayout(ic);ivl.setContentsMargins(0,0,0,0)
+        ic.setMinimumWidth(180)
+        ic.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                         QtWidgets.QSizePolicy.Policy.Expanding)
         sl_r=QtWidgets.QHBoxLayout();sl_r.addWidget(QtWidgets.QLabel("Frame:"))
         self.fslider=QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal);self.fslider.setRange(0,0)
         self.fslider.valueChanged.connect(self._on_slider);sl_r.addWidget(self.fslider)
         self.fslider_lbl=QtWidgets.QLabel("0/0");sl_r.addWidget(self.fslider_lbl);ivl.addLayout(sl_r)
-        ctrl=QtWidgets.QHBoxLayout();ctrl.addWidget(QtWidgets.QLabel("Cmap:"))
+        ctrl_w=QtWidgets.QWidget()
+        ctrl_w.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum,
+                             QtWidgets.QSizePolicy.Policy.Fixed)
+        ctrl=QtWidgets.QHBoxLayout(ctrl_w);ctrl.setContentsMargins(0,0,0,0)
+        ctrl.addWidget(QtWidgets.QLabel("Cmap:"))
         self.cmap_cb=QtWidgets.QComboBox()
         self.cmap_cb.addItems(["gray","viridis","plasma","magma","inferno","cividis","turbo","jet"])
         self.cmap_cb.setCurrentText(self.cfg["display"].get("colormap","viridis"))
@@ -133,6 +255,15 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
         self.auto_lev=QtWidgets.QCheckBox("Auto");self.auto_lev.setChecked(self.cfg["display"].get("auto_levels","true").lower()=="true")
         self.auto_lev.toggled.connect(self._on_auto_lev_toggle)
         ctrl.addWidget(self.auto_lev)
+        ctrl.addWidget(QtWidgets.QLabel("Preview compression:"))
+        self.preview_bin_cb=QtWidgets.QComboBox()
+        self.preview_bin_cb.addItems(["1x","2x","4x","8x","16x"])
+        self.preview_bin_cb.setCurrentText(self.cfg["display"].get("preview_bin","4x"))
+        self.preview_bin_cb.setToolTip(
+            "Downsample the live camera preview only.\n"
+            "Saved frames, ROI analysis, TIFF export, and video export stay full resolution.")
+        self.preview_bin_cb.currentTextChanged.connect(self._on_preview_bin_changed)
+        ctrl.addWidget(self.preview_bin_cb)
         self.btn_drr=QtWidgets.QPushButton("ΔR/R")
         self.btn_drr.setCheckable(True)
         self.btn_drr.setToolTip(
@@ -141,9 +272,11 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
             "Auto levels: symmetric \u00b198th-percentile stretch so even\n"
             "sub-percent changes fill the full colormap range.")
         self.btn_drr.setStyleSheet(
-            "QPushButton{padding:3px 8px;font-size:12px;}"
-            "QPushButton:checked{background:#c0392b;color:white;border-radius:4px;}"
-            "QPushButton:!checked{border-radius:4px;}")
+            "QPushButton{padding:3px 10px;font-size:12px;font-weight:bold;"
+            "border-radius:4px;border:1px solid #777;background:#555;color:#ddd;}"
+            "QPushButton:hover{background:#666;}"
+            "QPushButton:checked{background:#1f9d55;color:white;border:1px solid #28c76f;}"
+            "QPushButton:checked:hover{background:#27ae60;}")
         self.btn_drr.toggled.connect(self._on_drr_toggle)
         ctrl.addWidget(self.btn_drr)
         ctrl.addWidget(QtWidgets.QLabel("Rot°:"))
@@ -155,7 +288,37 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
             "±90 and ±180 are lossless; other angles use bilinear interpolation.")
         self.rot_sp.valueChanged.connect(self._on_rotation_changed)
         ctrl.addWidget(self.rot_sp)
-        ivl.addLayout(ctrl)
+        sep=QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.Shape.VLine)
+        sep.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+        ctrl.addWidget(sep)
+        ctrl.addWidget(QtWidgets.QLabel("CV:"))
+        self.cv_mode=QtWidgets.QComboBox();self.cv_mode.addItems(["I vs E","E vs t"])
+        self.cv_mode.currentTextChanged.connect(self._update_all_plots);ctrl.addWidget(self.cv_mode)
+        ctrl.addWidget(QtWidgets.QLabel("Y:"));self.cv_y=QtWidgets.QComboBox();self.cv_y.addItems(PLOT_VARS)
+        self.cv_y.setCurrentText(self.cfg["display"].get("cv_y","I (A)"))
+        self.cv_y.currentTextChanged.connect(lambda *_: self._on_plot_y_axis_changed("cv"));ctrl.addWidget(self.cv_y)
+        ctrl.addWidget(QtWidgets.QLabel("Cycle:"))
+        self.cv_cycle_cb=QtWidgets.QComboBox()
+        self.cv_cycle_cb.addItem("All")
+        self.cv_cycle_cb.setToolTip("Select which cycle to display, or All for every cycle.")
+        self.cv_cycle_cb.setFixedWidth(70)
+        self.cv_cycle_cb.currentIndexChanged.connect(self._update_all_plots)
+        ctrl.addWidget(self.cv_cycle_cb)
+        self.cv_cycle_color_row=QtWidgets.QHBoxLayout()
+        self.cv_cycle_color_row.setContentsMargins(0,0,0,0)
+        self.cv_cycle_color_row.setSpacing(2)
+        ctrl.addLayout(self.cv_cycle_color_row)
+        ctrl_scroll=QtWidgets.QScrollArea()
+        ctrl_scroll.setWidget(ctrl_w)
+        ctrl_scroll.setWidgetResizable(False)
+        ctrl_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        ctrl_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        ctrl_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        ctrl_scroll.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                  QtWidgets.QSizePolicy.Policy.Fixed)
+        ctrl_scroll.setFixedHeight(ctrl_w.sizeHint().height()+16)
+        self.top_panel_lay.addWidget(ctrl_scroll)
         self.drr_smooth_row=QtWidgets.QWidget()
         drr_sr=QtWidgets.QHBoxLayout(self.drr_smooth_row)
         drr_sr.setContentsMargins(0,0,0,0)
@@ -180,6 +343,7 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
         self.drr_smooth_row.setVisible(False)
         ivl.addWidget(self.drr_smooth_row)
         self.img_view=pg.GraphicsLayoutWidget();self.img_plot=self.img_view.addPlot();self.img_plot.setAspectLocked(True)
+        self.img_view.setMinimumWidth(80)
         self.img_item=pg.ImageItem();self.img_plot.addItem(self.img_item)
         # Cluster and PCA overlays sit above the camera image but stay hidden
         # until analysis produces results.
@@ -215,33 +379,23 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
         # The first ROI zone always exists and cannot be deleted.
         self.roi=pg.RectROI([10,10],[50,50],pen=pg.mkPen((r,g,b),width=2))
         self.roi.setZValue(10);self.img_plot.addItem(self.roi)
-        ivl.addWidget(self.img_view,stretch=1);tr.addWidget(ic)
+        ivl.addWidget(self.img_view,stretch=1);self.split_top.addWidget(ic)
         # CV plot panel: displays current vs potential or potential vs time.
         cv_c=QtWidgets.QWidget();cv_vl=QtWidgets.QVBoxLayout(cv_c);cv_vl.setContentsMargins(0,0,0,0)
-        cv_sp=QtWidgets.QWidget();cv_sp.setFixedHeight(CV_HEADER_SPACER_PX);cv_vl.addWidget(cv_sp)
-        cv_tr=QtWidgets.QHBoxLayout()
-        self.cv_mode=QtWidgets.QComboBox();self.cv_mode.addItems(["I vs E","E vs t"])
-        self.cv_mode.currentTextChanged.connect(self._update_all_plots);cv_tr.addWidget(self.cv_mode)
-        cv_tr.addWidget(QtWidgets.QLabel("Y:"));self.cv_y=QtWidgets.QComboBox();self.cv_y.addItems(PLOT_VARS)
-        self.cv_y.setCurrentText(self.cfg["display"].get("cv_y","I (A)"))
-        self.cv_y.currentTextChanged.connect(lambda *_: self._on_plot_y_axis_changed("cv"));cv_tr.addWidget(self.cv_y)
-        cv_tr.addStretch(1);cv_vl.addLayout(cv_tr)
-        cv_cyc_row=QtWidgets.QHBoxLayout()
-        cv_cyc_row.addWidget(QtWidgets.QLabel("Cycle:"))
-        self.cv_cycle_cb=QtWidgets.QComboBox()
-        self.cv_cycle_cb.addItem("All")
-        self.cv_cycle_cb.setToolTip("Select which cycle to display, or All for every cycle.")
-        self.cv_cycle_cb.setFixedWidth(70)
-        self.cv_cycle_cb.currentIndexChanged.connect(self._update_all_plots)
-        cv_cyc_row.addWidget(self.cv_cycle_cb)
-        self.cv_cycle_color_row=QtWidgets.QHBoxLayout()
-        cv_cyc_row.addLayout(self.cv_cycle_color_row)
-        cv_cyc_row.addStretch(1)
-        cv_vl.addLayout(cv_cyc_row)
-        self.cv_plot=pg.PlotWidget();self.cv_curve=self.cv_plot.plot([],[],pen=pg.mkPen(color='w',width=2))
+        cv_c.setMinimumWidth(260)
+        cv_c.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                           QtWidgets.QSizePolicy.Policy.Expanding)
+        cv_header_spacer=QtWidgets.QWidget()
+        cv_header_spacer.setFixedHeight(sl_r.sizeHint().height()+zone_row.sizeHint().height())
+        cv_vl.addWidget(cv_header_spacer)
+        self.cv_plot=pg.PlotWidget(title="Current vs Potential")
+        self.cv_plot.setLabel("bottom","Potential (V)")
+        self.cv_plot.setLabel("left","Current (A)")
+        self.cv_curve=self.cv_plot.plot([],[],pen=pg.mkPen(color='w',width=2))
         self.cv_smooth=self.cv_plot.plot([],[],pen=pg.mkPen(color=(255,180,0),width=2))
         self.cv_mk=pg.ScatterPlotItem(size=12,pen=pg.mkPen(None),brush=pg.mkBrush(255,255,0,220),symbol='o')
-        self.cv_plot.addItem(self.cv_mk);self.cv_mk.setZValue(20);cv_vl.addWidget(self.cv_plot);tr.addWidget(cv_c)
+        self.cv_plot.addItem(self.cv_mk);self.cv_mk.setZValue(20);cv_vl.addWidget(self.cv_plot);self.split_top.addWidget(cv_c)
+        self.top_panel_lay.addWidget(self.split_top,stretch=1)
         # ROI vs time panel: optical signal through time, plus optional cluster
         # mean traces on a secondary axis.
         rt_c=QtWidgets.QWidget();rt_vl=QtWidgets.QVBoxLayout(rt_c);rt_vl.setContentsMargins(0,0,0,0)
@@ -282,8 +436,9 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
         self.roi_t_plot.plotItem.getAxis("right").linkToView(self.roi_t_vb2)
         self.roi_t_vb2.setXLink(self.roi_t_plot.plotItem)
         self.roi_t_plot.plotItem.showAxis("right");self.roi_t_plot.plotItem.getAxis("right").setLabel("Cluster")
+        self.roi_t_plot.plotItem.hideAxis("right")
         self.roi_t_plot.plotItem.vb.sigResized.connect(lambda:self.roi_t_vb2.setGeometry(self.roi_t_plot.plotItem.vb.sceneBoundingRect()))
-        rt_vl.addWidget(self.roi_t_plot);br.addWidget(rt_c)
+        rt_vl.addWidget(self.roi_t_plot);self.split_bottom.addWidget(rt_c)
         # ROI vs potential / derivative panel. This is where optical response is
         # compared directly with the electrochemical waveform.
         re_c=QtWidgets.QWidget();re_vl=QtWidgets.QVBoxLayout(re_c);re_vl.setContentsMargins(0,0,0,0)
@@ -326,33 +481,66 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
         self.roi_e_plot.plotItem.getAxis("right").linkToView(self.roi_e_vb2)
         self.roi_e_vb2.setXLink(self.roi_e_plot.plotItem)
         self.roi_e_plot.plotItem.showAxis("right");self.roi_e_plot.plotItem.getAxis("right").setLabel("Cluster")
+        self.roi_e_plot.plotItem.hideAxis("right")
         self.roi_e_plot.plotItem.vb.sigResized.connect(lambda:self.roi_e_vb2.setGeometry(self.roi_e_plot.plotItem.vb.sceneBoundingRect()))
-        re_vl.addWidget(self.roi_e_plot);br.addWidget(re_c)
+        re_vl.addWidget(self.roi_e_plot);self.split_bottom.addWidget(re_c)
         # Right sidebar: run controls, status, setup, loading, analysis settings,
         # export, and traffic-light status.
         _sb_inner=QtWidgets.QWidget()
         sl=QtWidgets.QVBoxLayout(_sb_inner);sl.setContentsMargins(6,6,6,6);sl.setSpacing(4)
         sb=QtWidgets.QScrollArea()
         sb.setWidgetResizable(True);sb.setWidget(_sb_inner)
-        sb.setMinimumWidth(260);sb.setMaximumWidth(540)
+        sb.setMinimumWidth(240);sb.setMaximumWidth(900)
         sb.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        run_row=QtWidgets.QHBoxLayout()
+        live_grp=QtWidgets.QGroupBox("Live")
+        live_grp.setToolTip("Updates while an experiment is running.")
+        live_gl=QtWidgets.QGridLayout(live_grp)
+        live_gl.setContentsMargins(8,6,8,6);live_gl.setHorizontalSpacing(8);live_gl.setVerticalSpacing(3)
+        live_gl.setColumnStretch(1,1)
+        def _live_row(row,label,value):
+            name=QtWidgets.QLabel(label)
+            name.setStyleSheet("font-size:11px;color:#aaa;")
+            val=QtWidgets.QLabel(value)
+            val.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight|QtCore.Qt.AlignmentFlag.AlignVCenter)
+            val.setStyleSheet("font-size:13px;font-family:Consolas,monospace;font-weight:bold;")
+            live_gl.addWidget(name,row,0)
+            live_gl.addWidget(val,row,1)
+            return val
+        self.live_elapsed_lbl=_live_row(0,"Seconds","0.0 s")
+        self.live_E_lbl=_live_row(1,"Potential","-- V")
+        self.live_I_lbl=_live_row(2,"Current","-- A")
+        self.live_hold_lbl=_live_row(3,"Hold","--")
+        self.live_cycle_lbl=_live_row(4,"Cycle","--")
+        run_row.addWidget(live_grp,1)
         self.btn_run=QtWidgets.QPushButton("  RUN  ")
         self.btn_run.setStyleSheet("QPushButton{background:#27ae60;color:white;font-size:28px;font-weight:bold;border-radius:12px;padding:18px 0;min-height:60px}QPushButton:hover{background:#2ecc71}QPushButton:disabled{background:#7f8c8d}")
-        self.btn_run.clicked.connect(self._on_run);sl.addWidget(self.btn_run)
+        self.btn_run.clicked.connect(self._on_run);run_row.addWidget(self.btn_run,1)
+        sl.addLayout(run_row)
         self.btn_stop=QtWidgets.QPushButton("STOP")
         self.btn_stop.setStyleSheet("QPushButton{background:#c0392b;color:white;font-size:20px;font-weight:bold;border-radius:8px;padding:10px 0}QPushButton:disabled{background:#7f8c8d}")
         self.btn_stop.clicked.connect(self._on_stop);self.btn_stop.setEnabled(False);sl.addWidget(self.btn_stop)
+        self.btn_ref_capture=QtWidgets.QPushButton("Capture reference frame")
+        self.btn_ref_capture.setStyleSheet("font-size:14px;padding:7px;background:#34495e;color:white;border-radius:6px;")
+        self.btn_ref_capture.setToolTip(
+            "First click: start a live camera preview without saving frames.\n"
+            "Second click: use the latest preview frame as the image dR/R reference.\n"
+            "If no reference is captured, dR/R uses frame 0 as before.")
+        self.btn_ref_capture.clicked.connect(self._on_reference_capture)
+        sl.addWidget(self.btn_ref_capture)
         self.exp_type_lbl=QtWidgets.QLabel("")
         self.exp_type_lbl.setStyleSheet("font-size:11px;color:#aaa;")
         self.exp_type_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         sl.addWidget(self.exp_type_lbl);self._refresh_exp_lbl()
         sl.addSpacing(10)
-        self.status_lbl=QtWidgets.QLabel("Ready.");self.status_lbl.setWordWrap(True);self.status_lbl.setStyleSheet("font-size:13px;");sl.addWidget(self.status_lbl)
-        self.prog_lbl=QtWidgets.QLabel("");self.prog_lbl.setWordWrap(True);sl.addWidget(self.prog_lbl)
+        self.status_lbl=_ConsoleProxyLabel(self,"Status");self.status_lbl.setWordWrap(True)
+        self.prog_lbl=_ConsoleProxyLabel(self,"Progress");self.prog_lbl.setWordWrap(True)
+        self.status_lbl.setText("Ready.")
         perf_grp=QtWidgets.QGroupBox("Performance")
         perf_grp.setToolTip(
             "Live acquisition health.\n"
-            "Preview skipped means the live ROI preview skipped old frames to stay current; saved frames are still written by the worker.")
+            "Preview skipped means the live ROI preview skipped old frames to stay current.\n"
+            "Frame/echem gap estimates come from worker-side timing gaps before preview processing.")
         perf_gl=QtWidgets.QGridLayout(perf_grp)
         perf_gl.setSpacing(4);perf_gl.setColumnStretch(1,1)
         def _perf_row(row,label,value):
@@ -370,6 +558,9 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
         self.perf_fps_lbl=_perf_row(3,"FPS","0.0")
         self.perf_roi_ms_lbl=_perf_row(4,"ROI ms","--")
         self.perf_echem_lbl=_perf_row(5,"Echem points","0")
+        self.perf_frame_loss_lbl=_perf_row(6,"Frame gap est","0")
+        self.perf_echem_loss_lbl=_perf_row(7,"Echem gap est","0")
+        self.perf_stall_lbl=_perf_row(8,"Max loop gap","0 ms")
         sl.addWidget(perf_grp)
         self._update_perf_panel(force=True)
         sl.addSpacing(10)
@@ -499,10 +690,12 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
         sl.addSpacing(10);eg=QtWidgets.QGroupBox("Export");egl=QtWidgets.QVBoxLayout(eg)
         b=QtWidgets.QPushButton("Export all (ZIP)");b.clicked.connect(self._export_plots);egl.addWidget(b)
         b2=QtWidgets.QPushButton("Export frames (TIFF)");b2.clicked.connect(self._export_frames);egl.addWidget(b2)
+        b3=QtWidgets.QPushButton("Export video");b3.clicked.connect(self._export_video);egl.addWidget(b3)
         sl.addWidget(eg);sl.addStretch(1)
         tl_r=QtWidgets.QHBoxLayout();tl_r.addStretch(1);self.traffic=TrafficLight();tl_r.addWidget(self.traffic);tl_r.addStretch(1);sl.addLayout(tl_r)
-        ms=QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        mh.removeWidget(ps);mh.removeWidget(sb);ms.addWidget(ps);ms.addWidget(sb)
-        ms.setStretchFactor(0,5);ms.setStretchFactor(1,1);mh.addWidget(ms)
+        self.split_main=QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.split_main.setChildrenCollapsible(False);self.split_main.setHandleWidth(8)
+        mh.removeWidget(self.split_rows);mh.removeWidget(sb);self.split_main.addWidget(self.split_rows);self.split_main.addWidget(sb)
+        self.split_main.setStretchFactor(0,5);self.split_main.setStretchFactor(1,1);mh.addWidget(self.split_main)
 
 __all__ = [name for name in globals() if not name.startswith("__")]

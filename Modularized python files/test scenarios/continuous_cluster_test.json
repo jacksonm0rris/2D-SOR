@@ -1,0 +1,42 @@
+{
+    "description": "Continuous version of the 4x4 cluster test. All reflectance changes are continuous in time: ramp, sine, faradaic, and smoothstep transitions. No instantaneous jumps between reflectance levels. Use K=5 (4 response types + background), zscore normalization recommended.",
+    "background": 150,
+    "noise_std": 6,
+    "regions": [
+        {"_comment":"(0,0) ramp",        "type":"gaussian","cx":0.125,"cy":0.125,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"ramp","start":0.3,"end":2.0}},
+        {"_comment":"(1,0) sine",        "type":"gaussian","cx":0.375,"cy":0.125,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"sine","frequency":2.0,"phase":0,"offset":1.0,"amplitude":0.5}},
+        {"_comment":"(2,0) faradaic",    "type":"gaussian","cx":0.625,"cy":0.125,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"faradaic","E_peak":0.1,"width":0.02,"baseline":1.5,"peak_amplitude":-0.7}},
+        {"_comment":"(3,0) smoothstep",  "type":"gaussian","cx":0.875,"cy":0.125,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"smoothstep","t_step":0.4,"width":0.25,"before":0.5,"after":1.8}},
+
+        {"_comment":"(0,1) smoothstep",  "type":"gaussian","cx":0.125,"cy":0.375,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"smoothstep","t_step":0.4,"width":0.25,"before":0.5,"after":1.8}},
+        {"_comment":"(1,1) faradaic",    "type":"gaussian","cx":0.375,"cy":0.375,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"faradaic","E_peak":0.1,"width":0.02,"baseline":1.5,"peak_amplitude":-0.7}},
+        {"_comment":"(2,1) ramp",        "type":"gaussian","cx":0.625,"cy":0.375,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"ramp","start":0.3,"end":2.0}},
+        {"_comment":"(3,1) sine",        "type":"gaussian","cx":0.875,"cy":0.375,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"sine","frequency":2.0,"phase":0,"offset":1.0,"amplitude":0.5}},
+
+        {"_comment":"(0,2) faradaic",    "type":"gaussian","cx":0.125,"cy":0.625,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"faradaic","E_peak":0.1,"width":0.02,"baseline":1.5,"peak_amplitude":-0.7}},
+        {"_comment":"(1,2) ramp",        "type":"gaussian","cx":0.375,"cy":0.625,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"ramp","start":0.3,"end":2.0}},
+        {"_comment":"(2,2) smoothstep",  "type":"gaussian","cx":0.625,"cy":0.625,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"smoothstep","t_step":0.4,"width":0.25,"before":0.5,"after":1.8}},
+        {"_comment":"(3,2) sine",        "type":"gaussian","cx":0.875,"cy":0.625,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"sine","frequency":2.0,"phase":0,"offset":1.0,"amplitude":0.5}},
+
+        {"_comment":"(0,3) sine",        "type":"gaussian","cx":0.125,"cy":0.875,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"sine","frequency":2.0,"phase":0,"offset":1.0,"amplitude":0.5}},
+        {"_comment":"(1,3) smoothstep",  "type":"gaussian","cx":0.375,"cy":0.875,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"smoothstep","t_step":0.4,"width":0.25,"before":0.5,"after":1.8}},
+        {"_comment":"(2,3) ramp",        "type":"gaussian","cx":0.625,"cy":0.875,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"ramp","start":0.3,"end":2.0}},
+        {"_comment":"(3,3) faradaic",    "type":"gaussian","cx":0.875,"cy":0.875,"sigma":0.05,"amplitude":500,
+         "modulation":{"type":"faradaic","E_peak":0.1,"width":0.02,"baseline":1.5,"peak_amplitude":-0.7}}
+    ]
+}

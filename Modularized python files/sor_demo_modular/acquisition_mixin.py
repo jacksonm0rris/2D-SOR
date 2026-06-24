@@ -137,6 +137,14 @@ class AcquisitionMixin:
             "fps":0.0,
             "roi_ms":np.nan,
             "echem_points":0,
+            "frame_missed_est":0,
+            "frame_gap_events":0,
+            "max_frame_gap_ms":0.0,
+            "echem_missed_est":0,
+            "echem_gap_events":0,
+            "max_echem_gap_ms":0.0,
+            "worker_stall_events":0,
+            "max_worker_stall_ms":0.0,
             "last_panel_update":0.0,
         }
         self._update_perf_panel(force=True)
@@ -147,6 +155,7 @@ class AcquisitionMixin:
         labels=[
             "perf_frames_lbl","perf_skipped_lbl","perf_queue_lbl",
             "perf_fps_lbl","perf_roi_ms_lbl","perf_echem_lbl",
+            "perf_frame_loss_lbl","perf_echem_loss_lbl","perf_stall_lbl",
         ]
         if not all(hasattr(self,name) for name in labels):return
         stats=getattr(self,"_perf_stats",None)
@@ -164,6 +173,184 @@ class AcquisitionMixin:
         roi_ms=float(stats.get("roi_ms",np.nan))
         self.perf_roi_ms_lbl.setText("--" if not np.isfinite(roi_ms) else f"{roi_ms:.2f}")
         self.perf_echem_lbl.setText(f"{int(stats.get('echem_points',0)):,}")
+        frame_loss=int(stats.get("frame_missed_est",0))
+        frame_events=int(stats.get("frame_gap_events",0))
+        self.perf_frame_loss_lbl.setText(f"{frame_loss:,} ({frame_events})")
+        echem_loss=int(stats.get("echem_missed_est",0))
+        echem_events=int(stats.get("echem_gap_events",0))
+        self.perf_echem_loss_lbl.setText(f"{echem_loss:,} ({echem_events})")
+        stall_ms=float(stats.get("max_worker_stall_ms",0.0) or 0.0)
+        self.perf_stall_lbl.setText(f"{stall_ms:.0f} ms")
+
+    def _on_worker_perf(self,data):
+        # Worker-side timing gaps capture stalls before data reaches the GUI
+        # preview queue.
+        stats=getattr(self,"_perf_stats",None)
+        if stats is None or not isinstance(data,dict):return
+        for key in ("frame_missed_est","frame_gap_events","max_frame_gap_ms",
+                    "echem_missed_est","echem_gap_events","max_echem_gap_ms",
+                    "worker_stall_events","max_worker_stall_ms"):
+            if key in data:stats[key]=data[key]
+        self._update_perf_panel()
+
+    def _format_live_current(self,value):
+        # Show current in a human-readable unit while keeping the raw data in A.
+        try:v=float(value)
+        except Exception:return "-- A"
+        if not np.isfinite(v):return "-- A"
+        av=abs(v)
+        if av>=1e-3:return f"{v*1e3:.3g} mA"
+        if av>=1e-6:return f"{v*1e6:.3g} uA"
+        if av>=1e-9:return f"{v*1e9:.3g} nA"
+        return f"{v:.3g} A"
+
+    def _live_value_style(self,color="#ddd"):
+        return (f"font-size:13px;font-family:Consolas,monospace;"
+                f"font-weight:bold;color:{color};")
+
+    def _start_idle_ocp_monitor(self):
+        # After a real acquisition, keep showing the open-circuit potential while
+        # no experiment is running. This uses a worker so the GUI stays fluid.
+        if getattr(self,"_running",False):return
+        if getattr(self,"_ocp_worker",None) is not None:return
+        try:
+            w=IdleOCPWorker(self.cfg,interval_s=1.0,parent=self)
+        except Exception:
+            return
+        self._ocp_worker=w
+        w.ocp_ready.connect(self._on_idle_ocp,QtCore.Qt.ConnectionType.QueuedConnection)
+        w.status_msg.connect(self._on_idle_ocp_status,QtCore.Qt.ConnectionType.QueuedConnection)
+        w.finished.connect(lambda:self._on_idle_ocp_finished(w),
+                           QtCore.Qt.ConnectionType.QueuedConnection)
+        w.start()
+
+    def _stop_idle_ocp_monitor(self):
+        w=getattr(self,"_ocp_worker",None)
+        if w is not None:
+            try:w.request_stop()
+            except Exception:pass
+            try:w.wait(1500)
+            except Exception:pass
+        self._ocp_worker=None
+
+    def _on_idle_ocp_finished(self,worker):
+        if getattr(self,"_ocp_worker",None) is worker:
+            self._ocp_worker=None
+
+    def _on_idle_ocp(self,value):
+        self._idle_ocp_voltage=float(value)
+        self._last_idle_ocp_wall=time.time()
+        if not getattr(self,"_running",False):
+            self._update_live_readout(force=True)
+
+    def _on_idle_ocp_status(self,msg):
+        # Keep OCP monitor diagnostics visible but out of the main status line.
+        if hasattr(self,"prog_lbl") and not getattr(self,"_running",False):
+            self.prog_lbl.setText(str(msg))
+
+    def _live_hold_text(self):
+        phase=str(getattr(self,"_live_current_phase","") or "")
+        ph=np.asarray(getattr(self,"_live_phase_arr",[]))
+        if ph.size:
+            phase=str(ph[-1])
+        if not phase.startswith("hold"):
+            return "--"
+        label="Initial" if "init" in phase else "Final"
+        elapsed=np.nan
+        if ph.size:
+            tw=np.asarray(getattr(self,"_t_wall_echem",np.array([])),dtype=np.float64)
+            tt=np.asarray(getattr(self,"_t_all",np.array([])),dtype=np.float64)
+            axis=tw if tw.size>=ph.size else tt
+            n=min(ph.size,axis.size)
+            if n>0:
+                idx=n-1
+                while idx>0 and str(ph[idx-1])==phase:
+                    idx-=1
+                if np.isfinite(axis[n-1]) and np.isfinite(axis[idx]):
+                    elapsed=float(axis[n-1]-axis[idx])
+        elif getattr(self,"_live_ftw",[]):
+            ftw=np.asarray(self._live_ftw,dtype=np.float64)
+            ftw=ftw[np.isfinite(ftw)]
+            if ftw.size:
+                start=float(getattr(self,"_live_hold_start_wall",ftw[0]))
+                elapsed=float(ftw[-1]-start)
+        return label if not np.isfinite(elapsed) else f"{label} {max(0.0,elapsed):.1f} s"
+
+    def _estimate_live_cycle_text(self):
+        phase=str(getattr(self,"_live_current_phase","") or "")
+        if phase.startswith("hold_init"):
+            return "--"
+        E=np.asarray(getattr(self,"_E_cv",np.array([])),dtype=np.float64)
+        if E.size<3:
+            E=np.asarray(getattr(self,"_E_all",np.array([])),dtype=np.float64)
+        if E.size<3 or not np.any(np.isfinite(E)):
+            return "--"
+        try:
+            cycles=_detect_cycles(E,upper_v=self._get_upper_v())
+            current=max(1,len(cycles))
+        except Exception:
+            current=1
+        try:total=max(1,int(self.cfg["potentiostat"].get("cycles","1")))
+        except Exception:total=0
+        current=min(current,total) if total>0 else current
+        return f"{current}/{total}" if total>0 else str(current)
+
+    def _update_live_readout(self,force=False):
+        # Small top-right readout for the latest run time, potential, and
+        # current. It uses already-received worker arrays, so it does not add
+        # extra potentiostat or camera communication.
+        labels=("live_elapsed_lbl","live_E_lbl","live_I_lbl",
+                "live_hold_lbl","live_cycle_lbl")
+        if not all(hasattr(self,name) for name in labels):return
+        now=time.time()
+        if not force and now-getattr(self,"_last_live_readout_update",0.0)<0.1:return
+        self._last_live_readout_update=now
+        elapsed=np.nan
+        if getattr(self,"_t_all",np.array([])).size:
+            elapsed=float(self._t_all[-1])
+        elif getattr(self,"_live_ftw",[]):
+            ftw=np.asarray(self._live_ftw,dtype=np.float64)
+            ftw=ftw[np.isfinite(ftw)]
+            if ftw.size:elapsed=float(ftw[-1]-ftw[0])
+        E=float(self._E_all[-1]) if getattr(self,"_E_all",np.array([])).size else np.nan
+        I=float(self._I_all[-1]) if getattr(self,"_I_all",np.array([])).size else np.nan
+        using_idle_ocp=(not getattr(self,"_running",False)
+                        and np.isfinite(getattr(self,"_idle_ocp_voltage",np.nan)))
+        if using_idle_ocp:
+            E=float(self._idle_ocp_voltage)
+        self.live_elapsed_lbl.setText("-- s" if not np.isfinite(elapsed) else f"{elapsed:.1f} s")
+        if not np.isfinite(E):
+            self.live_E_lbl.setText("-- V")
+        elif using_idle_ocp:
+            self.live_E_lbl.setText(f"{E:.4f} V OCP")
+        else:
+            self.live_E_lbl.setText(f"{E:.4f} V")
+        self.live_I_lbl.setText(self._format_live_current(I))
+        self.live_E_lbl.setStyleSheet(
+            self._live_value_style("#2ecc71" if getattr(self,"_running",False) else "#ddd"))
+        if np.isfinite(I) and I>0:
+            self.live_I_lbl.setStyleSheet(self._live_value_style("#e74c3c"))
+        elif np.isfinite(I) and I<0:
+            self.live_I_lbl.setStyleSheet(self._live_value_style("#3498db"))
+        else:
+            self.live_I_lbl.setStyleSheet(self._live_value_style("#ddd"))
+        self.live_hold_lbl.setText(self._live_hold_text())
+        self.live_cycle_lbl.setText(self._estimate_live_cycle_text())
+
+    def _reset_live_readout(self):
+        self._last_live_readout_update=0.0
+        self._live_phase_arr=np.array([],dtype=object)
+        self._live_current_phase=""
+        self._live_hold_start_wall=np.nan
+        self._idle_ocp_voltage=np.nan
+        self._last_idle_ocp_wall=np.nan
+        if hasattr(self,"live_elapsed_lbl"):self.live_elapsed_lbl.setText("0.0 s")
+        if hasattr(self,"live_E_lbl"):self.live_E_lbl.setText("-- V")
+        if hasattr(self,"live_I_lbl"):self.live_I_lbl.setText("-- A")
+        if hasattr(self,"live_E_lbl"):self.live_E_lbl.setStyleSheet(self._live_value_style("#ddd"))
+        if hasattr(self,"live_I_lbl"):self.live_I_lbl.setStyleSheet(self._live_value_style("#ddd"))
+        if hasattr(self,"live_hold_lbl"):self.live_hold_lbl.setText("--")
+        if hasattr(self,"live_cycle_lbl"):self.live_cycle_lbl.setText("--")
 
     def _start_frame_processor(self):
         # Restart the live ROI worker so results from a prior run cannot leak
@@ -248,11 +435,14 @@ class AcquisitionMixin:
     def _clear_data(self):
         # Reset acquisition, plotting, ROI, and analysis state before a new run
         # or load. The generation counter invalidates late worker callbacks.
+        self._stop_idle_ocp_monitor()
         self._stop_frame_processor()
         self._frame_processor_generation+=1
         self._clear_test_preview_state()
         self._unlock_plot_axes()
         self._reset_perf_stats()
+        self._reset_live_readout()
+        self._auto_analyze_on_done=False
         # Clear raw electrochemistry arrays and frame-aligned arrays.
         # E/I/t arrays are potentiostat samples; frame_E/frame_I/frame_t are
         # interpolated values matched to camera frame timestamps.
@@ -282,7 +472,7 @@ class AcquisitionMixin:
         self._cv_last_draw=0.0
         # Frame stack information. _memmap is a NumPy view of the binary frame
         # file on disk, not a copy of all frames in memory.
-        self._frames_path=None;self._frames_hw=None;self._n_frames=0;self._memmap=None
+        self._frames_path=None;self._frames_hw=None;self._frames_dtype="float32";self._n_frames=0;self._memmap=None
         # Clear reference-frame, last-frame, PCA, and cluster results.
         self._ref_frame=None;self._ref_roi_val=None;self._last_frame=None
         self._engine=None;self._cl_means=None;self._clear_an()
@@ -360,6 +550,7 @@ class AcquisitionMixin:
         # for testing and demonstrating the pipeline.
         self._clear_test_preview_state()
         self._clear_data();self._running=True;self._set_btns(True);self.traffic.setState(TrafficLight.RED)
+        self._auto_analyze_on_done=True
         self._start_frame_processor()
         self.status_lbl.setText("Test...");self.prog_lbl.setText("")
         self._store_dir=tempfile.mkdtemp(prefix="sor_test_")
@@ -376,11 +567,106 @@ class AcquisitionMixin:
         self.btn_setup.setEnabled(not running);self.btn_test.setEnabled(not running)
         self.btn_load.setEnabled(not running)
         self.btn_analyze.setEnabled(not running)
+        if hasattr(self,"btn_ref_capture"):self.btn_ref_capture.setEnabled(not running)
+
+    def _set_reference_preview_ui(self,active):
+        # Reference preview uses the camera but does not run echem or save
+        # frames. Disable other actions while the camera is occupied.
+        self._ref_preview_active=bool(active)
+        if not hasattr(self,"btn_ref_capture"):return
+        if active:
+            self.btn_ref_capture.setText("Save reference frame")
+            self.btn_ref_capture.setStyleSheet(
+                "font-size:14px;padding:7px;background:#1f9d55;color:white;"
+                "border-radius:6px;font-weight:bold;")
+            self.btn_run.setEnabled(False);self.btn_setup.setEnabled(False)
+            self.btn_test.setEnabled(False);self.btn_load.setEnabled(False)
+            self.btn_analyze.setEnabled(False);self.btn_stop.setEnabled(True)
+        else:
+            self.btn_ref_capture.setText("Capture reference frame")
+            self.btn_ref_capture.setStyleSheet(
+                "font-size:14px;padding:7px;background:#34495e;color:white;border-radius:6px;")
+            self.btn_run.setEnabled(True);self.btn_setup.setEnabled(True)
+            self.btn_test.setEnabled(True);self.btn_load.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+            self.btn_analyze.setEnabled(self._memmap is not None and self._n_frames>0)
+
+    def _on_reference_capture(self):
+        # First click starts camera-only preview. Second click stores the latest
+        # preview frame as the image dR/R reference.
+        if getattr(self,"_running",False):return
+        if getattr(self,"_ref_preview_active",False):
+            frame=getattr(self,"_last_ref_preview_frame",None)
+            if frame is None:
+                QtWidgets.QMessageBox.information(
+                    self,"Reference frame","No preview frame has arrived yet.")
+                return
+            self._custom_drr_ref_frame=np.asarray(frame,dtype=np.float32).copy()
+            self._stop_reference_preview()
+            self.status_lbl.setText(
+                f"Captured dR/R reference frame ({frame.shape[1]} x {frame.shape[0]} px).")
+            self.prog_lbl.setText("Image ΔR/R will use this captured frame. If shape changes, frame 0 is used.")
+            self._show_frame(frame,preview_downsample=True)
+            return
+        self._start_reference_preview()
+
+    def _start_reference_preview(self):
+        if getattr(self,"_ref_preview_worker",None) is not None:return
+        self._last_ref_preview_frame=None
+        self._set_reference_preview_ui(True)
+        self.traffic.setState(TrafficLight.YELLOW)
+        self.status_lbl.setText("Starting reference preview...")
+        self.prog_lbl.setText("Move/adjust the sample if needed, then click Save reference frame.")
+        w=ReferencePreviewWorker(self.cfg,parent=self)
+        self._ref_preview_worker=w
+        w.new_frame.connect(self._on_reference_preview_frame,QtCore.Qt.ConnectionType.QueuedConnection)
+        w.status_msg.connect(lambda m:self.status_lbl.setText(m),QtCore.Qt.ConnectionType.QueuedConnection)
+        w.finished_ok.connect(self._on_reference_preview_done,QtCore.Qt.ConnectionType.QueuedConnection)
+        w.finished_err.connect(self._on_reference_preview_err,QtCore.Qt.ConnectionType.QueuedConnection)
+        w.start()
+
+    def _stop_reference_preview(self,wait_ms=1000):
+        w=getattr(self,"_ref_preview_worker",None)
+        if w is not None:
+            try:w.request_stop()
+            except Exception:pass
+            try:w.wait(wait_ms)
+            except Exception:pass
+        self._ref_preview_worker=None
+        self._set_reference_preview_ui(False)
+        if hasattr(self,"traffic"):self.traffic.setState(TrafficLight.GREEN)
+
+    def _on_reference_preview_frame(self,data):
+        frame=data.get("frame") if isinstance(data,dict) else None
+        if frame is None:return
+        frame=np.asarray(frame,dtype=np.float32)
+        self._last_ref_preview_frame=frame
+        self._last_frame=frame
+        self._frames_hw=frame.shape[:2]
+        self._show_frame(frame,preview_downsample=True)
+        idx=int(data.get("frame_idx",0)) if isinstance(data,dict) else 0
+        self.fslider.setRange(0,0);self.fslider.setValue(0)
+        self.fslider_lbl.setText(f"preview {idx}")
+
+    def _on_reference_preview_done(self,data=None):
+        if getattr(self,"_ref_preview_active",False):
+            self._ref_preview_worker=None
+            self._set_reference_preview_ui(False)
+            self.status_lbl.setText("Reference preview stopped.")
+            self.traffic.setState(TrafficLight.GREEN)
+
+    def _on_reference_preview_err(self,msg):
+        self._ref_preview_worker=None
+        self._set_reference_preview_ui(False)
+        self.traffic.setState(TrafficLight.GREEN)
+        self.status_lbl.setText("Reference preview error.")
+        QtWidgets.QMessageBox.warning(self,"Reference preview",str(msg)[:1000])
 
     def _on_run(self):
         # Start a hardware-backed experiment. The worker writes frames to a
         # binary file while emitting live electrochemistry and frame updates.
         if self._running:return
+        if getattr(self,"_ref_preview_active",False):return
         exp=self.cfg["potentiostat"].get("experiment_type",EXP_CV)
         # Ask the user where to save the metadata JSON. The frame binary is
         # saved beside it with a matching name.
@@ -399,7 +685,7 @@ class AcquisitionMixin:
         self._pending_json_path=json_path
         json_stem=os.path.splitext(os.path.basename(json_path))[0]
         # Keep the frame stack beside the selected JSON metadata path.
-        bin_path=os.path.join(save_dir,json_stem+"_frames.bin")
+        bin_path=os.path.join(save_dir,json_stem+"_frames_raw.bin")
         # Move the GUI into "running" state before starting device work.
         self._clear_data();self._running=True;self._set_btns(True);self.traffic.setState(TrafficLight.RED)
         self._start_frame_processor()
@@ -425,7 +711,9 @@ class AcquisitionMixin:
         if sp is None:
             # If no scenario was passed from the command line, ask the user to
             # choose one. If they cancel, TestWorker uses its default scenario.
-            sd=os.path.join(os.path.dirname(os.path.abspath(__file__)),"test_scenarios")
+            sd=os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),"..","test scenarios"))
+            if not os.path.isdir(sd):
+                sd=os.path.join(os.path.dirname(os.path.abspath(__file__)),"test_scenarios")
             p,_=QtWidgets.QFileDialog.getOpenFileName(self,"Scenario",sd if os.path.isdir(sd) else "","JSON (*.json);;All (*)")
             sp=p if p else None
         if preview_first:
@@ -444,6 +732,8 @@ class AcquisitionMixin:
         # Status/progress update small text labels in the GUI.
         w.status_msg.connect(lambda m:self.status_lbl.setText(m),QtCore.Qt.ConnectionType.QueuedConnection)
         w.progress.connect(self._on_prog,QtCore.Qt.ConnectionType.QueuedConnection)
+        if hasattr(w,"perf_update"):
+            w.perf_update.connect(self._on_worker_perf,QtCore.Qt.ConnectionType.QueuedConnection)
         # A worker either completes with a dataset dictionary or reports an error.
         w.finished_ok.connect(self._on_done,QtCore.Qt.ConnectionType.QueuedConnection)
         w.finished_err.connect(self._on_err,QtCore.Qt.ConnectionType.QueuedConnection)
@@ -451,6 +741,10 @@ class AcquisitionMixin:
     def _on_stop(self):
         # Ask the worker to stop cooperatively. Device cleanup happens inside
         # the worker; the GUI just disables Stop to avoid repeated requests.
+        if getattr(self,"_ref_preview_active",False):
+            self.status_lbl.setText("Stopping reference preview...")
+            self._stop_reference_preview()
+            return
         if self._worker:self.status_lbl.setText("Stopping...");self._worker.request_stop()
         self.btn_stop.setEnabled(False)
 
@@ -467,6 +761,7 @@ class AcquisitionMixin:
         # saved frame path, image shape, raw echem arrays, and echem values
         # interpolated onto each frame time.
         self._frames_path=ds["frames_path"];self._frames_hw=ds["frames_hw"]
+        self._frames_dtype=str(ds.get("frames_dtype","float32"))
         self._n_frames=ds["frames_count"]
         self._E_all=ds["E_all"];self._I_all=ds["I_all"];self._t_all=ds["t_all"]
         if "t_wall_echem" in ds:self._t_wall_echem=ds["t_wall_echem"]
@@ -481,7 +776,7 @@ class AcquisitionMixin:
                 h,w=self._frames_hw
                 # Memory-map the frame stack rather than loading the whole movie
                 # into RAM; downstream analysis can stream or slice it as needed.
-                self._memmap=np.memmap(self._frames_path,dtype=np.float32,mode="r",shape=(self._n_frames,h,w))
+                self._memmap=np.memmap(self._frames_path,dtype=np.dtype(self._frames_dtype),mode="r",shape=(self._n_frames,h,w))
                 self._last_frame=np.asarray(self._memmap[-1],dtype=np.float32)
                 self._show_frame(self._last_frame)
                 self.fslider.setRange(0,max(0,self._n_frames-1))
@@ -492,9 +787,9 @@ class AcquisitionMixin:
             # Save lightweight metadata so the dataset can be loaded later
             # without rerunning the experiment.
             mp=save_dataset_metadata(ds,json_path=self._pending_json_path)
-            self.status_lbl.setText(f"Done. {self._n_frames} frames. Click ⚙ Analyze to process.\n{mp}")
+            self.status_lbl.setText(f"Done. {self._n_frames} frames ({self._frames_dtype}). Click ⚙ Analyze to process.\n{mp}")
         except Exception as e:
-            self.status_lbl.setText(f"Done. {self._n_frames} frames (save err: {e}). Click ⚙ Analyze.")
+            self.status_lbl.setText(f"Done. {self._n_frames} frames ({self._frames_dtype}; save err: {e}). Click ⚙ Analyze.")
         self._pending_json_path=None
         self.btn_analyze.setEnabled(True)
         self.traffic.setState(TrafficLight.GREEN)
@@ -502,14 +797,33 @@ class AcquisitionMixin:
         if stats is not None:
             stats["saved_frames"]=self._n_frames
             stats["echem_points"]=int(self._E_all.size)
+            perf=ds.get("perf",{}) if isinstance(ds,dict) else {}
+            if isinstance(perf,dict):
+                for key in ("frame_missed_est","frame_gap_events","max_frame_gap_ms",
+                            "echem_missed_est","echem_gap_events","max_echem_gap_ms",
+                            "worker_stall_events","max_worker_stall_ms"):
+                    if key in perf:stats[key]=perf[key]
             self._update_perf_panel(force=True)
+        self._update_live_readout(force=True)
+        if not getattr(self,"_auto_analyze_on_done",False):
+            if hasattr(self,"prog_lbl"):
+                self.prog_lbl.setText("Idle OCP monitor starting...")
+            QtCore.QTimer.singleShot(1500,self._start_idle_ocp_monitor)
+        if getattr(self,"_auto_analyze_on_done",False):
+            self._auto_analyze_on_done=False
+            self.status_lbl.setText(f"Synthetic test complete. Analyzing {self._n_frames} frames...")
+            QtWidgets.QApplication.processEvents()
+            self._on_analyze()
 
     def _on_err(self,msg):
         # Worker errors arrive here. Reset the GUI and show a concise message.
+        self._stop_idle_ocp_monitor()
         self._stop_frame_processor()
         self._running=False;self._worker=None;self._set_btns(False);self.traffic.setState(TrafficLight.GREEN)
+        self._auto_analyze_on_done=False
         self.status_lbl.setText("Error.");QtWidgets.QMessageBox.warning(self,"Error",msg[:1000])
         self._update_perf_panel(force=True)
+        self._update_live_readout(force=True)
 
     def _on_analyze(self):
         """Run all deferred heavy processing after acquisition completes."""
@@ -564,7 +878,7 @@ class AcquisitionMixin:
         # Loading a dataset should leave the GUI in almost the same state as a
         # just-finished acquisition: frames are memory-mapped, echem arrays are
         # available, and Analyze can be clicked.
-        self._frames_path=ds["frames_path"];self._frames_hw=ds["frames_hw"];self._n_frames=ds["frames_count"]
+        self._frames_path=ds["frames_path"];self._frames_hw=ds["frames_hw"];self._frames_dtype=str(ds.get("frames_dtype","float32"));self._n_frames=ds["frames_count"]
         self._E_all=ds["E_all"];self._I_all=ds["I_all"];self._t_all=ds["t_all"]
         if "t_wall_echem" in ds:self._t_wall_echem=ds["t_wall_echem"]
         self._frame_E=ds["frame_E"];self._frame_I=ds["frame_I"]
@@ -577,7 +891,7 @@ class AcquisitionMixin:
                 h,w=self._frames_hw
                 # Loaded datasets use the same memory-map path as newly acquired
                 # datasets, so analysis and export do not care where data came from.
-                self._memmap=np.memmap(self._frames_path,dtype=np.float32,mode="r",shape=(self._n_frames,h,w))
+                self._memmap=np.memmap(self._frames_path,dtype=np.dtype(self._frames_dtype),mode="r",shape=(self._n_frames,h,w))
                 # Show the final frame as a useful preview of the loaded dataset.
                 self._last_frame=np.asarray(self._memmap[-1],dtype=np.float32);self._show_frame(self._last_frame)
                 self.fslider.setRange(0,max(0,self._n_frames-1));self.fslider.setValue(self._n_frames-1)
@@ -591,6 +905,7 @@ class AcquisitionMixin:
             stats["saved_frames"]=self._n_frames
             stats["echem_points"]=int(self._E_all.size)
             self._update_perf_panel(force=True)
+        self._update_live_readout(force=True)
 
     def _on_load(self):
         # Let the user pick either the metadata JSON directly or the containing
@@ -617,7 +932,7 @@ class AcquisitionMixin:
                 store=path
         except Exception as e:QtWidgets.QMessageBox.critical(self,"Load",str(e));return
         self._clear_data();self._store_dir=store;self._load_ds(ds)
-        self.status_lbl.setText(f"Loaded {self._n_frames} frames. Click ⚙ Analyze to process.")
+        self.status_lbl.setText(f"Loaded {self._n_frames} frames ({self._frames_dtype}). Click ⚙ Analyze to process.")
         self.btn_analyze.setEnabled(True)
 
     def _on_prog(self,pts,frames):
@@ -627,6 +942,7 @@ class AcquisitionMixin:
             stats["saved_frames"]=int(frames)
             stats["echem_points"]=int(pts)
             self._update_perf_panel()
+        self._update_live_readout()
 
     def _on_echem(self,data):
         # Store the latest electrochemistry stream. Phase labels let the live CV
@@ -642,12 +958,15 @@ class AcquisitionMixin:
             # Keep only CV-labeled points for the live CV curve when the worker
             # labels initial and final holds separately.
             _ph=np.asarray(data["phase"])
+            self._live_phase_arr=_ph
+            if _ph.size:self._live_current_phase=str(_ph[-1])
             _cv_mask=(_ph=="cv")
             self._E_cv=E[_cv_mask]
             self._I_cv=I[_cv_mask]
             self._t_cv=t[_cv_mask]
             self._tw_cv=tw[_cv_mask] if tw.size else np.array([],dtype=np.float64)
         else:
+            self._live_phase_arr=np.array([],dtype=object)
             self._E_cv=E;self._I_cv=I
             self._t_cv=t;self._tw_cv=tw
         self._live_eE_arr=E;self._live_eI_arr=I
@@ -656,6 +975,7 @@ class AcquisitionMixin:
         if stats is not None:
             stats["echem_points"]=int(E.size)
             self._update_perf_panel()
+        self._update_live_readout()
         now=time.time()
         if now-self._cv_last_draw>=0.1:
             # Throttle redraws to about 10 per second so plotting does not
@@ -671,6 +991,10 @@ class AcquisitionMixin:
         # responsible for keeping the GUI preview and frame slider current.
         frame=data["frame"];tw=data["t_wall"];pwr=data["power"];fidx=data["frame_idx"]
         self._last_frame=frame;self._n_frames=fidx+1
+        phase=str(data.get("phase",getattr(self,"_live_current_phase","")) or "")
+        if phase and phase!=getattr(self,"_live_current_phase",""):
+            self._live_current_phase=phase
+            self._live_hold_start_wall=tw if phase.startswith("hold") else np.nan
         # Record frame dimensions the first time a frame arrives.
         if self._frames_hw is None:self._frames_hw=frame.shape[:2]
         self._live_ftw.append(tw);self._live_fpwr.append(pwr)
@@ -682,6 +1006,7 @@ class AcquisitionMixin:
             if recent.size>=2 and recent[-1]>recent[0]:
                 stats["fps"]=(recent.size-1)/(recent[-1]-recent[0])
             self._update_perf_panel()
+        self._update_live_readout()
         n=fidx+1
         self._ensure_live_capacity(n)
         # Keep the frame slider pinned to the newest frame during acquisition.
@@ -692,7 +1017,7 @@ class AcquisitionMixin:
             # Show a throttled live camera preview. The worker has already saved
             # every frame, so this display rate can be lower than acquisition
             # rate without losing data.
-            self._show_frame(frame)
+            self._show_frame(frame,preview_downsample=True)
             self._last_live_frame_draw=now
         # Convert the current zone selections into masks for this frame shape.
         masks=tuple(self._get_zone_mask_flats(frame.shape[:2]))

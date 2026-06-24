@@ -24,6 +24,7 @@ class _BaseCVWorker(QtCore.QThread):
     new_frame  = QtCore.pyqtSignal(object)
     status_msg = QtCore.pyqtSignal(str)
     progress   = QtCore.pyqtSignal(int, int)
+    perf_update = QtCore.pyqtSignal(object)
     finished_ok  = QtCore.pyqtSignal(object)
     finished_err = QtCore.pyqtSignal(str)
 
@@ -58,13 +59,14 @@ class _BaseCVWorker(QtCore.QThread):
         ci       = int(cam.get("camera_index", "0"))
         bf       = int(cam.get("bin_factor", "1"))
         bm       = cam.get("bin_mode", "mean")
+        frame_dtype = cam.get("frame_dtype", "uint16")
         cap_int  = max(10, int(cam.get("capture_interval_ms", "33")))
         fw       = int(cam.get("frame_wait_ms", "500"))
         use_pm   = pmc.get("enabled", "false").lower() == "true"
         pmv      = pmc.get("visa", "")
         os.makedirs(self.sd, exist_ok=True)
-        fp = self.bin_path if self.bin_path else os.path.join(self.sd, "frames_f32.bin")
-        sink = FrameFileSink(fp); bl = None; pm = None
+        fp = self.bin_path if self.bin_path else os.path.join(self.sd, "frames.bin")
+        sink = FrameFileSink(fp,dtype=frame_dtype); bl = None; pm = None
         # E/I/t arrays collect potentiostat samples. twe stores wall-clock times
         # used for camera/echem alignment. ftw/fpw store frame times and power.
         Ea, Ia, ta, twe, Ephase = [], [], [], [], []
@@ -129,9 +131,29 @@ class _BaseCVWorker(QtCore.QThread):
 
                     seq_thread.start()
                     cf = 0; lee = 0.0; lft = 0.0
+                    perf = {
+                        "frame_missed_est": 0,
+                        "frame_gap_events": 0,
+                        "max_frame_gap_ms": 0.0,
+                        "echem_missed_est": 0,
+                        "echem_gap_events": 0,
+                        "max_echem_gap_ms": 0.0,
+                        "worker_stall_events": 0,
+                        "max_worker_stall_ms": 0.0,
+                    }
+                    last_loop = time.time()
+                    last_perf_emit = 0.0
+                    echem_dt_nominal = None
+                    last_dev_time = None
 
                     while seq_thread.is_alive() and not self._stop:
                         now = time.time()
+                        loop_gap_ms = (now - last_loop) * 1000.0
+                        last_loop = now
+                        if loop_gap_ms > max(250.0, cap_int * 3.0):
+                            perf["worker_stall_events"] += 1
+                            perf["max_worker_stall_ms"] = max(
+                                perf["max_worker_stall_ms"], loop_gap_ms)
                         # Poll every program for newly available echem points.
                         for label, prog in sequence:
                             if prog is None: continue
@@ -168,6 +190,24 @@ class _BaseCVWorker(QtCore.QThread):
                                         ta.append(dev_times[k])
                                         twe.append(float(point_walls[k]))
                                         Ephase.append(_ep)
+                                        dt_dev = dev_times[k] - last_dev_time if (
+                                            last_dev_time is not None
+                                            and np.isfinite(dev_times[k])
+                                            and np.isfinite(last_dev_time)) else np.nan
+                                        if np.isfinite(dt_dev) and dt_dev > 0:
+                                            if echem_dt_nominal is None:
+                                                echem_dt_nominal = dt_dev
+                                            else:
+                                                gap_ms = dt_dev * 1000.0
+                                                perf["max_echem_gap_ms"] = max(perf["max_echem_gap_ms"], gap_ms)
+                                                if echem_dt_nominal > 0 and dt_dev > 2.5 * echem_dt_nominal:
+                                                    missed = max(0, int(round(dt_dev / echem_dt_nominal)) - 1)
+                                                    perf["echem_missed_est"] += missed
+                                                    perf["echem_gap_events"] += 1
+                                                else:
+                                                    echem_dt_nominal = 0.9 * echem_dt_nominal + 0.1 * dt_dev
+                                        if np.isfinite(dev_times[k]):
+                                            last_dev_time = dev_times[k]
                                 prog._seen_pts = len(cd)
 
                         if (now - lee) > 0.15 and Ea:
@@ -189,6 +229,13 @@ class _BaseCVWorker(QtCore.QThread):
                                 "phase": list(Ephase)})
                             lee = now
 
+                        frame_gap_ms = (now - lft) * 1000.0 if lft > 0 else 0.0
+                        if lft > 0 and frame_gap_ms > cap_int * 1.5:
+                            perf["max_frame_gap_ms"] = max(perf["max_frame_gap_ms"], frame_gap_ms)
+                            if frame_gap_ms > cap_int * 2.5:
+                                missed = max(0, int(round(frame_gap_ms / cap_int)) - 1)
+                                perf["frame_missed_est"] += missed
+                                perf["frame_gap_events"] += 1
                         if (now - lft) * 1000 >= cap_int:
                             # Trigger one camera frame at the configured capture
                             # interval, then wait up to frame_wait_ms for it.
@@ -198,11 +245,16 @@ class _BaseCVWorker(QtCore.QThread):
                             while (time.time() - t0g) * 1000 < fw:
                                 fr = camera.get_pending_frame_or_null()
                                 if fr is not None:
-                                    img = np.asarray(fr.image_buffer).astype(np.float32, copy=False)
+                                    img = np.asarray(fr.image_buffer)
+                                    raw_dtype = str(img.dtype)
                                     # Optional camera binning reduces frame size
                                     # before saving and display.
                                     if bf > 1: img = _bin_2d(img, bf, bm)
                                     sink.append(img); tw = time.time(); pwr = np.nan
+                                    if cf == 0:
+                                        mb=img.size*np.dtype(sink.dtype or np.float32).itemsize/1024**2
+                                        self.status_msg.emit(
+                                            f"Frame storage: {sink.dtype_name} ({mb:.2f} MB/frame; camera {raw_dtype})")
                                     if pm:
                                         try: pwr = float(pm.get_power())
                                         except: pass
@@ -222,6 +274,9 @@ class _BaseCVWorker(QtCore.QThread):
                                     cf += 1; self.progress.emit(len(Ea), cf); break
                                 time.sleep(0.001)
                             lft = now
+                        if now - last_perf_emit > 0.5:
+                            self.perf_update.emit(dict(perf))
+                            last_perf_emit = now
                         time.sleep(0.002)
 
                     if Ea:
@@ -261,12 +316,14 @@ class _BaseCVWorker(QtCore.QThread):
                 "frames_path":  fp,
                 "frames_count": sink.count,
                 "frames_hw":    sink.shape_hw,
+                "frames_dtype": sink.dtype_name or "float32",
                 "frame_E":      _interp_echem(f_tw, etw, eE),
                 "frame_I":      _interp_echem(f_tw, etw, eI),
                 "frame_t":      _interp_echem(f_tw, etw, et),
                 "frame_t_wall": f_tw,
                 "frame_power":  np.array(fpw, dtype=np.float64),
-                "E_all": eE, "I_all": eI, "t_all": et, "t_wall_echem": etw})
+                "E_all": eE, "I_all": eI, "t_all": et, "t_wall_echem": etw,
+                "perf": dict(perf)})
 
         except Exception as e:
             try: sink.close()
@@ -341,6 +398,145 @@ class LiveCVWorker(_BaseCVWorker):
 
 LiveCVAWorker = LiveCVWorker
 
+
+class IdleOCPWorker(QtCore.QThread):
+    """Read open-circuit potential while the app is idle after a run."""
+
+    ocp_ready=QtCore.pyqtSignal(float)
+    status_msg=QtCore.pyqtSignal(str)
+
+    def __init__(self,cfg,interval_s=1.0,parent=None):
+        super().__init__(parent)
+        self.cfg=cfg
+        self.interval_s=max(0.5,float(interval_s))
+        self._stop=False
+
+    def request_stop(self):
+        self._stop=True
+
+    def run(self):
+        ok,ebl,blp,err=try_import_ebl()
+        if not ok:
+            self.status_msg.emit("Idle OCP unavailable: easy-biologic import failed.")
+            return
+        if not hasattr(blp,"OCV"):
+            self.status_msg.emit("Idle OCP unavailable: OCV program not found.")
+            return
+        bl=None
+        try:
+            addr=self.cfg["potentiostat"].get("bl_address","192.168.0.9")
+            bl=ebl.BiologicDevice(addr)
+            bl.connect(None,None)
+            self.status_msg.emit("Idle OCP monitor active.")
+            while not self._stop:
+                t0=time.time()
+                try:
+                    # OCP is measured with a short open-circuit program, leaving
+                    # the cell unbiased while the GUI is idle.
+                    try:
+                        op=blp.OCV(bl,{"duration":1.0},channels=[0],autoconnect=False)
+                    except TypeError:
+                        op=blp.OCV(bl,{"duration":1.0},channels=[0])
+                    op.run("data")
+                    ch=[]
+                    for _ in range(10):
+                        ch=op.data.get(0,[])
+                        if ch:break
+                        if self._stop:break
+                        time.sleep(0.05)
+                    if ch:
+                        v,_=_extract_echem_point(ch[-1])
+                        if np.isfinite(v):self.ocp_ready.emit(float(v))
+                    else:
+                        self.status_msg.emit("Idle OCP monitor: no OCP data returned.")
+                except Exception as e:
+                    self.status_msg.emit(f"Idle OCP monitor paused: {e}")
+                while not self._stop and time.time()-t0<self.interval_s:
+                    time.sleep(0.05)
+        except Exception as e:
+            self.status_msg.emit(f"Idle OCP monitor failed: {e}")
+        finally:
+            if bl is not None:
+                try:bl.disconnect()
+                except Exception:pass
+
+
+class ReferencePreviewWorker(QtCore.QThread):
+    """Camera-only preview worker used to capture a dR/R reference frame.
+
+    This worker intentionally does not open the potentiostat and does not write
+    images to disk. It only emits live camera frames until the GUI asks it to
+    stop.
+    """
+
+    new_frame=QtCore.pyqtSignal(object)
+    status_msg=QtCore.pyqtSignal(str)
+    finished_ok=QtCore.pyqtSignal(object)
+    finished_err=QtCore.pyqtSignal(str)
+
+    def __init__(self,cfg,parent=None):
+        super().__init__(parent)
+        self.cfg=cfg
+        self._stop=False
+
+    def request_stop(self):
+        self._stop=True
+
+    def run(self):
+        if not CAM_AVAILABLE:
+            self.finished_err.emit(CAM_IMPORT_ERROR or "Camera missing");return
+        _ensure_dll()
+        cam=self.cfg["camera"]
+        exp_us=int(cam.get("exposure_us","7000"))
+        ci=int(cam.get("camera_index","0"))
+        bf=int(cam.get("bin_factor","1"))
+        bm=cam.get("bin_mode","mean")
+        cap_int=max(10,int(cam.get("capture_interval_ms","33")))
+        fw=int(cam.get("frame_wait_ms","500"))
+        cf=0
+        try:
+            self.status_msg.emit("Reference preview...")
+            with TLCameraSDK() as sdk:
+                cams=sdk.discover_available_cameras()
+                if not cams:raise RuntimeError("No cameras found")
+                cid=cams[min(max(ci,0),len(cams)-1)]
+                with sdk.open_camera(cid) as camera:
+                    try:camera.exposure_time_us=exp_us
+                    except:pass
+                    camera.frames_per_trigger_zero_for_unlimited=0
+                    camera.image_poll_timeout_ms=50
+                    camera.arm(2)
+                    last_frame_t=0.0
+                    while not self._stop:
+                        now=time.time()
+                        if (now-last_frame_t)*1000.0>=cap_int:
+                            try:camera.issue_software_trigger()
+                            except:pass
+                            t0=time.time()
+                            while not self._stop and (time.time()-t0)*1000.0<fw:
+                                fr=camera.get_pending_frame_or_null()
+                                if fr is not None:
+                                    img=np.asarray(fr.image_buffer).astype(np.float32,copy=False)
+                                    if bf>1:img=_bin_2d(img,bf,bm)
+                                    tw=time.time()
+                                    self.new_frame.emit({
+                                        "frame":img,
+                                        "t_wall":tw,
+                                        "power":np.nan,
+                                        "frame_idx":cf,
+                                        "phase":"reference_preview"})
+                                    cf+=1
+                                    break
+                                time.sleep(0.001)
+                            last_frame_t=now
+                        time.sleep(0.001)
+                    try:camera.disarm()
+                    except:pass
+            self.finished_ok.emit({"frames":cf})
+        except Exception as e:
+            self.finished_err.emit(f"{e}\n\n{traceback.format_exc()}")
+
+
 def load_test_scenario(path):
     # Test scenarios describe synthetic image regions and how they respond to E.
     with open(path,"r",encoding="utf-8") as f:return json.load(f)
@@ -394,6 +590,13 @@ def _cmod(cfg,E,tf):
     if mt=="constant":return float(cfg.get("value",1.0))
     elif mt=="sine":return float(cfg.get("offset",1))+float(cfg.get("amplitude",0.3))*np.sin(2*np.pi*float(cfg.get("frequency",1))*tf+float(cfg.get("phase",0)))
     elif mt=="step":return float(cfg.get("after",1.5)) if tf>=float(cfg.get("t_step",0.5)) else float(cfg.get("before",1))
+    elif mt=="smoothstep":
+        before=float(cfg.get("before",1.0));after=float(cfg.get("after",1.5))
+        center=float(cfg.get("t_step",cfg.get("center",0.5)))
+        width=max(float(cfg.get("width",0.1)),1e-6)
+        u=np.clip((tf-(center-width/2.0))/width,0.0,1.0)
+        s=u*u*(3.0-2.0*u)
+        return before+(after-before)*s
     elif mt=="faradaic":return float(cfg.get("baseline",1))+float(cfg.get("peak_amplitude",0.3))*np.exp(-((E-float(cfg.get("E_peak",0.1)))**2)/(2*float(cfg.get("width",0.02))**2))
     elif mt=="ramp":return float(cfg.get("start",1))+(float(cfg.get("end",1.5))-float(cfg.get("start",1)))*tf
     return 1.0
@@ -421,8 +624,8 @@ class TestWorker(QtCore.QThread):
                 sc=default_test_scenario()
                 self.status_msg.emit("Test (default)...")
             os.makedirs(self.sd,exist_ok=True)
-            fp=self.bin_path if self.bin_path else os.path.join(self.sd,"frames_f32.bin")
-            sink=FrameFileSink(fp)
+            fp=self.bin_path if self.bin_path else os.path.join(self.sd,"frames.bin")
+            sink=FrameFileSink(fp,dtype=self.cfg["camera"].get("frame_dtype","uint16"))
             pot=self.cfg["potentiostat"];sv=float(pot.get("start_v","0"));uv=float(pot.get("upper_v","0.25"))
             lv=float(pot.get("lower_v","-0.1"));step=max(float(pot.get("step_v","0.001")),1e-6)
             sr=max(float(pot.get("scan_rate","0.02")),1e-6)
@@ -466,6 +669,7 @@ class TestWorker(QtCore.QThread):
             etw=np.array(twe,dtype=np.float64);eE=np.array(Ea,dtype=np.float64)
             eI=np.array(Ia,dtype=np.float64);et=np.array(ta,dtype=np.float64);f_tw=np.array(ftw_,dtype=np.float64)
             self.finished_ok.emit({"frames_path":fp,"frames_count":sink.count,"frames_hw":sink.shape_hw,
+                "frames_dtype":sink.dtype_name or "float32",
                 "frame_E":_interp_echem(f_tw,etw,eE),"frame_I":_interp_echem(f_tw,etw,eI),
                 "frame_t":_interp_echem(f_tw,etw,et),"frame_t_wall":f_tw,
                 "frame_power":np.array(fpw_,dtype=np.float64),"E_all":eE,"I_all":eI,"t_all":et,"t_wall_echem":etw})

@@ -19,10 +19,13 @@ DEFAULT_SETTINGS={
     },
     # Camera settings control exposure and how often frames are requested.
     "camera":{"camera_index":"0","exposure_us":"7000","bin_factor":"1","bin_mode":"mean",
-        "capture_interval_ms":"33","frame_wait_ms":"500"},
+        "capture_interval_ms":"33","frame_wait_ms":"500","frame_dtype":"uint16"},
     # Display settings remember plot variables and smoothing preferences.
     "display":{"colormap":"viridis","level_min":"0.0","level_max":"1000.0","auto_levels":"true",
-        "cv_y":"I (A)","roi_t_y":"R","roi_e_y":"R","smooth_window":"1","smooth_mode":"boxcar"},
+        "cv_y":"I (A)","roi_t_y":"R","roi_e_y":"R","smooth_window":"1","smooth_mode":"boxcar",
+        "preview_bin":"4x","window_w":"1600","window_h":"980",
+        "split_main":"1200,320","split_vertical":"470,360,110",
+        "split_top":"760,760","split_bottom":"760,760"},
     # Power meter data can optionally normalize optical ROI intensity.
     "power_meter":{"enabled":"false","visa":"USB0::0x1313::0x8076::M01240030::INSTR","normalize_roi":"false"},
     # Reference-frame normalization divides ROI traces by a selected frame.

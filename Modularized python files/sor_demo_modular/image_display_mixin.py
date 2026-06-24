@@ -82,14 +82,22 @@ class ImageDisplayMixin:
         # saved raw frames or the analysis data.
         if not hasattr(self,"btn_drr") or not self.btn_drr.isChecked():
             return self._apply_rotation(frame)
-        if self._memmap is None or self._n_frames < 1:
-            return frame
-        ref = np.asarray(self._memmap[0], dtype=np.float32)
+        # A user-captured reference frame is preferred. If it is absent or has a
+        # different shape from the current data, fall back to the first saved
+        # frame, which preserves the original behavior.
+        ref = getattr(self,"_custom_drr_ref_frame",None)
+        if ref is not None:
+            ref=np.asarray(ref,dtype=np.float32)
+        if ref is None or ref.shape != frame.shape:
+            if self._memmap is None or self._n_frames < 1:
+                return self._apply_rotation(frame)
+            ref = np.asarray(self._memmap[0], dtype=np.float32)
         if ref.shape != frame.shape:
-            return frame
+            return self._apply_rotation(frame)
         safe_ref = np.where(np.abs(ref) < 1e-10, np.ones_like(ref), ref)
-        # Display dR/R relative to the first frame:
-        # (current frame - first frame) / first frame.
+        # Display dR/R relative to the captured reference frame when present,
+        # otherwise relative to the first saved frame:
+        # (current frame - reference frame) / reference frame.
         drr = (frame.astype(np.float32) - ref) / safe_ref
         return self._apply_rotation(self._spatial_smooth_drr(drr))
 
@@ -161,7 +169,7 @@ class ImageDisplayMixin:
     def _on_rotation_changed(self,*_):
         # Rotation changes zone geometry, so cached masks are no longer valid.
         self._invalidate_zone_mask_cache()
-        if self._memmap is None or self._n_frames==0:return
+        if self._refresh_current_display_frame():return
         val=self.fslider.value()
         if val<self._n_frames:
             self._show_frame(np.asarray(self._memmap[val],dtype=np.float32))
@@ -238,13 +246,69 @@ class ImageDisplayMixin:
                     pass
         return drr
 
-    def _show_frame(self,frame):
+    def _preview_bin_factor(self):
+        # Parse the live-preview bin dropdown. Invalid or missing values fall
+        # back to 1x, meaning full-resolution preview.
+        cb=getattr(self,"preview_bin_cb",None)
+        txt=cb.currentText() if cb is not None else "1x"
+        try:return max(1,int(str(txt).lower().replace("x","").strip()))
+        except Exception:return 1
+
+    def _downsample_preview_frame(self,img,factor):
+        # Average small blocks for display speed. This is only used for the
+        # live preview image; the saved frame stack and analysis arrays are not
+        # touched.
+        if factor<=1:return img
+        h,w=img.shape[:2]
+        h2=(h//factor)*factor
+        w2=(w//factor)*factor
+        if h2<factor or w2<factor:return img
+        cropped=np.asarray(img[:h2,:w2],dtype=np.float32)
+        return cropped.reshape(h2//factor,factor,w2//factor,factor).mean(axis=(1,3)).astype(np.float32)
+
+    def _set_image_rect(self,shape_hw):
+        # ImageItem coordinates normally match pixel coordinates. When the live
+        # preview is binned, the image has fewer pixels, but it should still
+        # occupy the same displayed width/height so ROI boxes stay aligned with
+        # the original full-resolution frame.
+        try:
+            h,w=shape_hw[:2]
+            self.img_item.setRect(QtCore.QRectF(0,0,float(w),float(h)))
+        except Exception:pass
+
+    def _live_preview_downsample_active(self):
+        # Live acquisition and reference-frame preview are the two places where
+        # the image display is intentionally compressed for speed.
+        return bool(getattr(self,"_running",False) or getattr(self,"_ref_preview_active",False))
+
+    def _refresh_current_display_frame(self):
+        # Display-control changes such as ΔR/R, auto-levels, rotation, or
+        # preview compression should redraw the current live/reference preview
+        # with compression still applied. Static saved frames stay full-res.
+        if self._live_preview_downsample_active() and getattr(self,"_last_frame",None) is not None:
+            self._show_frame(self._last_frame,preview_downsample=True)
+            return True
+        if self._memmap is None or self._n_frames==0:return False
+        val=self.fslider.value()
+        if val<self._n_frames:
+            self._show_frame(np.asarray(self._memmap[val],dtype=np.float32))
+            return True
+        return False
+
+    def _show_frame(self,frame,preview_downsample=False):
         # Central display routine: prepare the frame, show it, and update color
         # levels either automatically or from manual controls.
+        # Important order: ΔR/R normalization and rotation happen first, then
+        # live-preview compression is applied to the finished display image.
         display=self._get_display_frame(np.asarray(frame,dtype=np.float32))
-        self.img_item.setImage(display,autoLevels=False)
+        display_hw=display.shape[:2]
+        shown=display
+        if preview_downsample:
+            shown=self._downsample_preview_frame(display,self._preview_bin_factor())
+        self.img_item.setImage(shown,autoLevels=False)
+        self._set_image_rect(display_hw if preview_downsample else shown.shape[:2])
         if self.auto_lev.isChecked():
-            v=display[np.isfinite(display)]
+            v=shown[np.isfinite(shown)]
             if v.size>0:
                 drr_mode=hasattr(self,"btn_drr") and self.btn_drr.isChecked()
                 if drr_mode:
@@ -262,21 +326,22 @@ class ImageDisplayMixin:
                     self.lmin.blockSignals(False);self.lmax.blockSignals(False)
         else:self._ml()
 
+    def _on_preview_bin_changed(self,*_):
+        # Changing the preview bin factor should affect only the current live
+        # preview. Static loaded frames stay full resolution so the user can
+        # inspect details after acquisition.
+        self.cfg["display"]["preview_bin"]=self.preview_bin_cb.currentText()
+        self._refresh_current_display_frame()
+
     def _on_auto_lev_toggle(self,checked=None):
         # Re-render the current frame when auto-level mode changes.
-        if self._memmap is None or self._n_frames==0:return
-        val=self.fslider.value()
-        if val<self._n_frames:
-            self._show_frame(np.asarray(self._memmap[val],dtype=np.float32))
+        self._refresh_current_display_frame()
 
     def _on_drr_toggle(self,checked=None):
         # Re-render the current frame when display dR/R mode or smoothing changes.
         is_on=hasattr(self,"btn_drr") and self.btn_drr.isChecked()
         if hasattr(self,"drr_smooth_row"):self.drr_smooth_row.setVisible(is_on)
-        if self._memmap is None or self._n_frames==0:return
-        val=self.fslider.value()
-        if val<self._n_frames:
-            self._show_frame(np.asarray(self._memmap[val],dtype=np.float32))
+        self._refresh_current_display_frame()
 
     def _on_slider(self,val):
         # Display the selected frame from the memory-mapped frame stack.

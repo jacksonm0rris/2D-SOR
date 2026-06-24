@@ -6,6 +6,13 @@ signals, splitting CV sweeps, and computing LOWESS trend lines.
 """
 from .dependencies import *
 
+try:
+    from numba import njit
+    NUMBA_AVAILABLE=True
+except Exception:
+    njit=None
+    NUMBA_AVAILABLE=False
+
 def safe_float(x,d=np.nan):
     # Convert device values to float; return NaN/default if the value is missing
     # or stored in an unexpected form.
@@ -15,9 +22,19 @@ def safe_float(x,d=np.nan):
 def _bin_2d(img,f,mode):
     # Camera binning combines f-by-f pixel blocks. "mean" preserves approximate
     # brightness scale; "sum" preserves total counts.
-    if f<=1:return np.asarray(img,dtype=np.float32)
-    i=np.asarray(img,dtype=np.float32);h,w=i.shape;h2=(h//f)*f;w2=(w//f)*f
+    arr=np.asarray(img)
+    if f<=1:return arr
+    h,w=arr.shape;h2=(h//f)*f;w2=(w//f)*f
     if h2==0 or w2==0:raise ValueError("Bin too large")
+    if arr.dtype==np.uint16:
+        # Preserve compact integer storage for raw camera data. Mean binning is
+        # rounded to the nearest camera count; sum binning uses uint32 so the
+        # writer can fall back if values exceed uint16 range.
+        c=arr[:h2,:w2].reshape(h2//f,f,w2//f,f)
+        summed=c.sum(axis=(1,3),dtype=np.uint32)
+        if mode=="sum":return summed
+        return np.rint(summed.astype(np.float32)/float(f*f)).astype(np.uint16)
+    i=arr.astype(np.float32,copy=False)
     c=i[:h2,:w2].reshape(h2//f,f,w2//f,f)
     return c.sum(axis=(1,3),dtype=np.float32) if mode=="sum" else c.mean(axis=(1,3),dtype=np.float32)
 
@@ -76,6 +93,90 @@ def _smooth_savgol(arr,window):
 def _smooth(arr,window,use_savgol=False):
     if use_savgol:return _smooth_savgol(arr,window)
     return _smooth_boxcar(arr,window)
+
+if NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def _lowess_smooth_numba(x,y,frac):
+        n=len(x)
+        if n<4:
+            return y.copy()
+        k=int(round(frac*n))
+        if k<4:k=4
+        if k>n:k=n
+        y_out=np.empty(n,dtype=np.float64)
+        dist=np.empty(n,dtype=np.float64)
+        for i in range(n):
+            x0=x[i]
+            for j in range(n):
+                d=x[j]-x0
+                if d<0.0:d=-d
+                dist[j]=d
+            order=np.argsort(dist)
+            h=dist[order[k-1]]
+            if h<=0.0:h=1.0
+            s0=0.0;s1=0.0;s2=0.0;s3=0.0;s4=0.0
+            t0=0.0;t1=0.0;t2=0.0
+            sw=0.0;wy=0.0
+            for jj in range(k):
+                idx=order[jj]
+                d=dist[idx]
+                u=d/h
+                one_minus=1.0-u*u*u
+                w=one_minus*one_minus*one_minus
+                dx=x[idx]-x0
+                dx2=dx*dx
+                dx3=dx2*dx
+                dx4=dx2*dx2
+                yi=y[idx]
+                s0+=w
+                s1+=w*dx
+                s2+=w*dx2
+                s3+=w*dx3
+                s4+=w*dx4
+                t0+=w*yi
+                t1+=w*yi*dx
+                t2+=w*yi*dx2
+                sw+=w
+                wy+=w*yi
+            # Solve the weighted quadratic fit in centered coordinates. At
+            # x[i], dx is zero, so the fitted value is the intercept c0.
+            a00=s0;a01=s1;a02=s2
+            a10=s1;a11=s2;a12=s3
+            a20=s2;a21=s3;a22=s4
+            det=(a00*(a11*a22-a12*a21)
+                 -a01*(a10*a22-a12*a20)
+                 +a02*(a10*a21-a11*a20))
+            if det>1e-18 or det<-1e-18:
+                det0=(t0*(a11*a22-a12*a21)
+                      -a01*(t1*a22-a12*t2)
+                      +a02*(t1*a21-a11*t2))
+                y_out[i]=det0/det
+            elif sw>1e-12:
+                y_out[i]=wy/sw
+            else:
+                y_out[i]=y[i]
+        return y_out
+
+    @njit(cache=True,fastmath=True)
+    def _block_mean_stack_numba(raw,sp_h,sp_w,bs):
+        n=raw.shape[0]
+        out=np.empty((sp_h*sp_w,n),dtype=np.float32)
+        scale=1.0/(bs*bs)
+        for fi in range(n):
+            for by in range(sp_h):
+                y0=by*bs
+                for bx in range(sp_w):
+                    x0=bx*bs
+                    total=0.0
+                    for dy in range(bs):
+                        yy=y0+dy
+                        for dx in range(bs):
+                            total+=raw[fi,yy,x0+dx]
+                    out[by*sp_w+bx,fi]=total*scale
+        return out
+else:
+    _lowess_smooth_numba=None
+    _block_mean_stack_numba=None
 
 def _detect_cycles(E, upper_v=None, cfg=None):
     # Split an E-vs-frame trace into initial hold, CV cycles, and final hold.
@@ -165,10 +266,19 @@ def _split_sweeps(E, *arrays):
 def _lowess_smooth(x, y, frac=0.05):
     # LOWESS creates a local weighted trend line. For each x[i], it fits a small
     # quadratic model to nearby points, with closer points weighted more heavily.
+    x=np.asarray(x,dtype=np.float64)
+    y=np.asarray(y,dtype=np.float64)
+    if NUMBA_AVAILABLE and _lowess_smooth_numba is not None:
+        try:
+            return _lowess_smooth_numba(np.ascontiguousarray(x),
+                                        np.ascontiguousarray(y),
+                                        float(frac))
+        except Exception:
+            pass
     n = len(x)
     if n < 4:
         return y.copy()
-    k = max(4, int(round(frac * n)))
+    k = min(n, max(4, int(round(frac * n))))
     y_out = np.empty(n, dtype=np.float64)
     for i in range(n):
         dist = np.abs(x - x[i])

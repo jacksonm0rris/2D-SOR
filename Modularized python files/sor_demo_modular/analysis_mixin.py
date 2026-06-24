@@ -56,11 +56,20 @@ class AnalysisMixin:
                 if rgb is not None:self.pca_overlay.setImage(rgb);self.pca_overlay.setVisible(True)
             else:self.pca_overlay.setVisible(False)
 
+    def _update_cluster_axis_visibility(self):
+        # The right axes are only useful when cluster mean traces are visible.
+        show=bool(getattr(self,"_cl_curves_t",{})) or bool(getattr(self,"_cl_curves_e",{}))
+        if hasattr(self,"roi_t_plot"):
+            self.roi_t_plot.plotItem.showAxis("right",show=show)
+        if hasattr(self,"roi_e_plot"):
+            self.roi_e_plot.plotItem.showAxis("right",show=show)
+
     def _clear_an(self):
         # Remove cluster traces from the secondary axes on ROI plots.
         for c in self._cl_curves_t.values():self.roi_t_vb2.removeItem(c)
         for c in self._cl_curves_e.values():self.roi_e_vb2.removeItem(c)
         self._cl_curves_t.clear();self._cl_curves_e.clear()
+        self._update_cluster_axis_visibility()
 
     def _ensure_an(self,K):
         # Keep plot curve objects synchronized with the currently selected
@@ -75,6 +84,7 @@ class AnalysisMixin:
                 r,g,b=CLUSTER_COLORS[k%len(CLUSTER_COLORS)];pen=pg.mkPen(color=(r,g,b),width=2)
                 self._cl_curves_t[k]=pg.PlotDataItem([],[],pen=pen);self.roi_t_vb2.addItem(self._cl_curves_t[k])
                 self._cl_curves_e[k]=pg.PlotDataItem([],[],pen=pen);self.roi_e_vb2.addItem(self._cl_curves_e[k])
+        self._update_cluster_axis_visibility()
 
     def _run_an(self):
         # Run PCA/K-means using the current GUI settings. This is normally called
@@ -155,6 +165,7 @@ class AnalysisMixin:
             if k in self._cl_curves_t:
                 t=self._frame_t[cs:cs+n];m1=np.isfinite(t)&np.isfinite(y);self._cl_curves_t[k].setData(t[m1],y[m1])
                 e=self._frame_E[cs:cs+n];m2=np.isfinite(e)&np.isfinite(y);self._cl_curves_e[k].setData(e[m2],y[m2])
+        self._update_cluster_axis_visibility()
         self.roi_t_vb2.enableAutoRange();self.roi_e_vb2.enableAutoRange()
 
 __all__ = [name for name in globals() if not name.startswith("__")]

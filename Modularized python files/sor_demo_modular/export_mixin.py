@@ -258,9 +258,64 @@ class ExportMixin:
         except Exception as e:QtWidgets.QMessageBox.critical(self,"Export",str(e))
         self.traffic.setState(TrafficLight.GREEN)
 
+    def _export_video(self):
+        # Export every saved camera frame as a normalized grayscale video. This
+        # is for quick viewing/presentations; the binary frame file remains the
+        # exact saved camera data.
+        if self._memmap is None or self._n_frames==0:
+            QtWidgets.QMessageBox.information(self,"Export","No frames.");return
+        try:
+            import imageio.v2 as imageio
+        except Exception:
+            QtWidgets.QMessageBox.critical(
+                self,"Export","Video export needs imageio and imageio-ffmpeg.\n\npip install imageio imageio-ffmpeg")
+            return
+        path,_=QtWidgets.QFileDialog.getSaveFileName(
+            self,"Video","sor_frames.mp4","MP4 video (*.mp4);;AVI video (*.avi);;All (*)")
+        if not path:return
+        if not os.path.splitext(path)[1]:
+            path+=".mp4"
+        fps,ok=QtWidgets.QInputDialog.getDouble(
+            self,"Video frame rate","Frames per second:",20.0,0.1,1000.0,1)
+        if not ok:return
+        self.traffic.setState(TrafficLight.YELLOW);QtWidgets.QApplication.processEvents()
+        try:
+            self.status_lbl.setText("Computing video scale...")
+            QtWidgets.QApplication.processEvents()
+            n_stat=min(50,self._n_frames)
+            stat_idx=np.linspace(0,self._n_frames-1,n_stat,dtype=int)
+            vals=np.asarray(self._memmap[stat_idx],dtype=np.float32).ravel()
+            vals=vals[np.isfinite(vals)]
+            lo=float(np.percentile(vals,1)) if vals.size>0 else 0.0
+            hi=float(np.percentile(vals,99)) if vals.size>0 else 1.0
+            span=max(hi-lo,1e-10)
+            ext=os.path.splitext(path)[1].lower()
+            writer_kwargs={"fps":float(fps)}
+            if ext==".mp4":
+                writer_kwargs.update({"codec":"libx264","quality":8,"macro_block_size":1})
+            with imageio.get_writer(path,**writer_kwargs) as writer:
+                for i in range(self._n_frames):
+                    frame=np.asarray(self._memmap[i],dtype=np.float32)
+                    frame_u8=(np.clip((frame-lo)/span,0.0,1.0)*255.0).astype(np.uint8)
+                    writer.append_data(frame_u8)
+                    if i==0 or (i+1)%50==0 or i+1==self._n_frames:
+                        self.status_lbl.setText(f"Writing video {i+1}/{self._n_frames}")
+                        QtWidgets.QApplication.processEvents()
+            self.status_lbl.setText("Done.")
+            QtWidgets.QMessageBox.information(self,"Export",
+                f"Saved video with {self._n_frames} frames at {fps:g} fps:\n{path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self,"Export",f"{e}\n\n{traceback.format_exc()}")
+        self.traffic.setState(TrafficLight.GREEN)
+
     def closeEvent(self,event):
         # Close hardware/worker resources and remember display settings before
         # the Qt window actually exits.
+        if (hasattr(self,"_stop_reference_preview") and
+            (getattr(self,"_ref_preview_worker",None) is not None
+             or getattr(self,"_ref_preview_active",False))):
+            self._stop_reference_preview()
+        if hasattr(self,"_stop_idle_ocp_monitor"):self._stop_idle_ocp_monitor()
         if self._worker and self._worker.isRunning():self._worker.request_stop();self._worker.wait(3000)
         self._stop_frame_processor()
         self._memmap=None
@@ -271,6 +326,8 @@ class ExportMixin:
         d["cv_y"]=self.cv_y.currentText();d["roi_t_y"]="R" if self.roi_t_y.currentText() in ("ROI Sum","R") else self.roi_t_y.currentText()
         d["smooth_window"]=str(self.smooth_sp.value())
         d["smooth_mode"]="savgol" if self.smooth_sg_btn.isChecked() else "boxcar"
+        if hasattr(self,"preview_bin_cb"):d["preview_bin"]=self.preview_bin_cb.currentText()
+        if hasattr(self,"_save_window_layout_to_config"):self._save_window_layout_to_config()
         save_settings(self.cfg);super().closeEvent(event)
 
 __all__ = [name for name in globals() if not name.startswith("__")]

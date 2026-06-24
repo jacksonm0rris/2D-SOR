@@ -22,7 +22,8 @@ def save_dataset_metadata(ds,json_path=None,directory=None):
     # Store only the frame filename, not an absolute path, so the dataset folder
     # can be moved as long as the JSON and frame binary stay together.
     meta={"frames_path":os.path.basename(fp),"frames_count":int(ds["frames_count"]),
-          "frames_hw":list(ds["frames_hw"]) if ds["frames_hw"] else None}
+          "frames_hw":list(ds["frames_hw"]) if ds["frames_hw"] else None,
+          "frames_dtype":str(ds.get("frames_dtype","float32"))}
     # NumPy arrays are converted to lists because JSON cannot store arrays.
     for k in ["frame_E","frame_I","frame_t","frame_t_wall","frame_power","E_all","I_all","t_all"]:
         meta[k]=ds[k].tolist()
@@ -39,7 +40,8 @@ def load_dataset_from_json(json_path):
     if not os.path.isfile(ffp):raise FileNotFoundError(f"Missing frames file: {ffp}")
     # Rebuild the same dictionary shape used by a just-finished acquisition.
     ds={"frames_path":ffp,"frames_count":int(meta["frames_count"]),
-        "frames_hw":tuple(meta["frames_hw"]) if meta["frames_hw"] else None}
+        "frames_hw":tuple(meta["frames_hw"]) if meta["frames_hw"] else None,
+        "frames_dtype":str(meta.get("frames_dtype","float32"))}
     for k in ["frame_E","frame_I","frame_t","frame_t_wall","frame_power","E_all","I_all","t_all"]:
         ds[k]=np.array(meta[k],dtype=np.float64)
     if "t_wall_echem" in meta:ds["t_wall_echem"]=np.array(meta["t_wall_echem"],dtype=np.float64)
@@ -54,7 +56,8 @@ def load_dataset_from_directory(d):
     ffp=os.path.join(d,meta["frames_path"])
     if not os.path.isfile(ffp):raise FileNotFoundError(f"Missing: {ffp}")
     ds={"frames_path":ffp,"frames_count":int(meta["frames_count"]),
-        "frames_hw":tuple(meta["frames_hw"]) if meta["frames_hw"] else None}
+        "frames_hw":tuple(meta["frames_hw"]) if meta["frames_hw"] else None,
+        "frames_dtype":str(meta.get("frames_dtype","float32"))}
     for k in ["frame_E","frame_I","frame_t","frame_t_wall","frame_power","E_all","I_all","t_all"]:
         ds[k]=np.array(meta[k],dtype=np.float64)
     if "t_wall_echem" in meta:ds["t_wall_echem"]=np.array(meta["t_wall_echem"],dtype=np.float64)
