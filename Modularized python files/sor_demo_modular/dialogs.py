@@ -1,18 +1,25 @@
 """Setup dialog and status widgets.
 
-Generated from sor_demo_v19_26-6-2.py during modularization.
+The setup dialog lets the user edit experiment settings without touching the
+INI file directly. It writes values back into the shared config object; settings.py
+handles saving that config to disk.
 """
 from .dependencies import *
 from .settings import *
 
 class SetupDialog(QtWidgets.QDialog):
+    """Dialog for potentiostat, camera, display, power, and reference settings."""
+
     def __init__(self,cfg,parent=None):
         super().__init__(parent);self.setWindowTitle("Setup");self.setMinimumWidth(520);self.cfg=cfg
         self._build();self._load_cfg();self._on_exp_radio()
 
     def _build(self):
+        # The dialog is organized into tabs so experiment, camera, and display
+        # settings are not all mixed together.
         lo=QtWidgets.QVBoxLayout(self);tabs=QtWidgets.QTabWidget();lo.addWidget(tabs)
 
+        # Potentiostat tab: connection, waveform, holds, and instrument ranges.
         scroll=QtWidgets.QScrollArea();scroll.setWidgetResizable(True)
         pw=QtWidgets.QWidget();g=QtWidgets.QGridLayout(pw);g.setVerticalSpacing(6);r=0
 
@@ -27,6 +34,8 @@ class SetupDialog(QtWidgets.QDialog):
         g.addWidget(btn_w,r,2);r+=1
 
         exp_grp=QtWidgets.QGroupBox("Experiment Type");exp_lay=QtWidgets.QHBoxLayout(exp_grp)
+        # CV Advanced currently shares most code with CV, but the extra settings
+        # are kept visible only when that mode is selected.
         self.rb_cv =QtWidgets.QRadioButton("CV (Standard)")
         self.rb_cva=QtWidgets.QRadioButton("CV Advanced (CVA)")
         self.rb_cv.setChecked(True)
@@ -81,6 +90,8 @@ class SetupDialog(QtWidgets.QDialog):
         scroll.setWidget(pw);tabs.addTab(scroll,"Potentiostat")
 
         cw=QtWidgets.QWidget();cg=QtWidgets.QGridLayout(cw);r=0
+        # Camera tab: exposure, frame timing, binning, power-meter correction,
+        # and reference-frame normalization.
         for lbl,attr,lo_,hi_,val_ in [("Cam idx","ci",0,16,0),("Exp \u00b5s","ce",1,10000000,7000),
             ("Cap ms","cint",10,60000,33),("Wait ms","cfw",10,60000,500)]:
             cg.addWidget(QtWidgets.QLabel(lbl),r,0)
@@ -100,6 +111,7 @@ class SetupDialog(QtWidgets.QDialog):
         cg.addWidget(rfg,r,0,1,2);tabs.addTab(cw,"Camera")
 
         dw=QtWidgets.QWidget();dg=QtWidgets.QGridLayout(dw);r=0
+        # Display tab: image colormap and intensity level defaults.
         dg.addWidget(QtWidgets.QLabel("Cmap"),r,0)
         self.cmap=QtWidgets.QComboBox()
         self.cmap.addItems(["gray","viridis","plasma","magma","inferno","cividis","turbo","jet"])
@@ -115,14 +127,18 @@ class SetupDialog(QtWidgets.QDialog):
         lo.addLayout(br)
 
     def _on_exp_radio(self):
+        # Show CVA-only controls only when CV Advanced is selected.
         self.cva_grp.setVisible(self.rb_cva.isChecked())
 
     def _dbl(self,g,r,l,lo,hi,d,v):
+        # Convenience helper for labeled floating-point spin boxes.
         g.addWidget(QtWidgets.QLabel(l),r,0)
         s=QtWidgets.QDoubleSpinBox();s.setDecimals(d);s.setRange(lo,hi);s.setValue(v)
         g.addWidget(s,r,1);return s
 
     def _load_cfg(self):
+        # Copy saved config values into the widgets. This is the "show current
+        # settings" half of the dialog.
         p=self.cfg["potentiostat"];c=self.cfg["camera"]
         pm=self.cfg["power_meter"];rf=self.cfg["reference"];d=self.cfg["display"]
         exp=p.get("experiment_type",EXP_CV)
@@ -159,6 +175,8 @@ class SetupDialog(QtWidgets.QDialog):
         self.dlmax.setValue(float(d.get("level_max","1000")))
 
     def _sv(self):
+        # Copy widget values back into the config object, then save to disk.
+        # This is the "commit changes" half of the dialog.
         p=self.cfg["potentiostat"];c=self.cfg["camera"]
         pm=self.cfg["power_meter"];rf=self.cfg["reference"];d=self.cfg["display"]
         p["experiment_type"]=EXP_CVA if self.rb_cva.isChecked() else EXP_CV
@@ -187,6 +205,7 @@ class SetupDialog(QtWidgets.QDialog):
         save_settings(self.cfg);self.accept()
 
     def _tc(self):
+        # Test one BioLogic address by attempting to connect and disconnect.
         a=self.bl_addr.text().strip()
         if not a:self.tst.setText("Enter address");return
         self.tst.setText("Testing...");self.btn_tc.setEnabled(False);QtWidgets.QApplication.processEvents()
@@ -197,6 +216,8 @@ class SetupDialog(QtWidgets.QDialog):
         self.btn_tc.setEnabled(True)
 
     def _scan(self):
+        # Ask easy-biologic to discover available devices and optionally copy the
+        # selected address into the setup field.
         self.tst.setText("Scanning...");self.btn_scan.setEnabled(False);QtWidgets.QApplication.processEvents()
         ok,ebl,_,err=try_import_ebl()
         if not ok:self.tst.setText(f"Scan fail: {err[:200]}");self.btn_scan.setEnabled(True);return
@@ -231,11 +252,14 @@ class SetupDialog(QtWidgets.QDialog):
 
 
 class TrafficLight(QtWidgets.QWidget):
+    """Small status indicator used by acquisition and analysis workflows."""
+
     RED=0;YELLOW=1;GREEN=2
     def __init__(self,parent=None):
         super().__init__(parent);self._state=self.GREEN;self.setFixedSize(90,36)
     def setState(self,state):self._state=state;self.update()
     def paintEvent(self,event):
+        # Draw three circles and fill only the active state brightly.
         p=QtGui.QPainter(self);p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         colors=[(200,50,50),(220,200,50),(50,200,50)]
         for i,c in enumerate(colors):

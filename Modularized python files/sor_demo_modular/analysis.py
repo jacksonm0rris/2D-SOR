@@ -1,6 +1,14 @@
 """Frame storage and analysis engine.
 
-Generated from sor_demo_v19_26-6-2.py during modularization.
+This file contains the non-GUI analysis machinery:
+
+* FrameFileSink writes camera frames to disk during acquisition.
+* AnalysisEngine turns a movie into block-level reflectance traces.
+* PCA reduces each trace to a few response-pattern coordinates.
+* K-means groups regions that behaved similarly during the experiment.
+
+For an electrochemist, the important idea is that the engine looks for spatial
+regions whose optical response over time/potential has a similar shape.
 """
 from .dependencies import *
 from .numeric_utils import *
@@ -8,11 +16,14 @@ from .numeric_utils import *
 # Writes incoming image frames to a compact raw float32 file so long runs do not
 # need to keep every full-resolution frame in RAM.
 class FrameFileSink:
+    """Append-only writer for the camera frame binary file."""
     def __init__(self,path):
         # Track the output file, the first observed frame shape, and frame count.
         self.path=path;self._fh=open(path,"wb");self.shape_hw=None;self.count=0
     def append(self,fr):
         # Accept only 2D frames, enforce a stable shape, and append raw pixels.
+        # Shape checks matter because a single binary file can only be reopened
+        # correctly if every frame has the same height and width.
         fr=np.asarray(fr,dtype=np.float32,order="C")
         if fr.ndim!=2:raise ValueError("2D expected")
         if self.shape_hw is None:self.shape_hw=(int(fr.shape[0]),int(fr.shape[1]))
@@ -33,6 +44,12 @@ class FrameFileSink:
 # Converts a frame stack into spatial blocks, runs PCA on the temporal traces,
 # clusters pixels/blocks by PCA coordinates, and prepares overlay data for the UI.
 class AnalysisEngine:
+    """Run PCA/K-means analysis on a saved frame stack.
+
+    The engine works on spatial blocks rather than individual pixels by default.
+    Each block has a reflectance trace through time. PCA compresses those traces,
+    and K-means assigns each block to a cluster of similar behavior.
+    """
     NORM_RAW="raw";NORM_ZSCORE="zscore";NORM_DROR="dR/R"
     def __init__(self,frame_h,frame_w,block_size=4,K=5,n_pca=5,norm_mode="zscore",frame_stride=1):
         # Store analysis parameters and derive the coarse spatial grid dimensions.
@@ -60,6 +77,8 @@ class AnalysisEngine:
         # strided subset for speed while cluster means still use all frames.
         xp=self._xp;bs=self.block_size
         all_idx=np.arange(n_frames)
+        # frame_stride lets PCA use every nth frame for speed. Cluster means
+        # still use all frames, so exported traces keep full time resolution.
         sub_idx=all_idx[::self.frame_stride]
         n_sub=len(sub_idx)
 
@@ -67,12 +86,17 @@ class AnalysisEngine:
             # Convert one contiguous frame slice into block-averaged signals.
             raw=np.asarray(mm[i0:i1],dtype=np.float32)
             if rotate_fn is not None:
+                # Rotation is applied before block averaging so analysis matches
+                # the display orientation and ROI geometry.
                 rotated=[]
                 for k in range(raw.shape[0]):
                     rf=rotate_fn(raw[k])
                     rotated.append(rf)
                 raw=np.stack(rotated,axis=0)
             raw=raw[:,:self.sp_h*bs,:self.sp_w*bs]
+            # Reshape into blocks: frame, block-row, pixel-row, block-col,
+            # pixel-col. Averaging over the pixel axes gives one signal per
+            # spatial block.
             sp=raw.reshape(i1-i0,self.sp_h,bs,self.sp_w,bs).mean(axis=(2,4)).reshape(i1-i0,self.n_sp).T
             return sp
 
@@ -91,9 +115,13 @@ class AnalysisEngine:
         # changes rather than only absolute brightness differences.
         xp=self._xp
         if self.norm_mode==self.NORM_ZSCORE:
+            # Z-score asks: does this region rise/fall like another region,
+            # regardless of absolute brightness?
             mu=xp.mean(data,axis=1,keepdims=True);std=xp.std(data,axis=1,keepdims=True)
             std=xp.where(std<1e-10,xp.ones_like(std),std);return(data-mu)/std
         elif self.norm_mode==self.NORM_DROR:
+            # dR/R asks: what fractional change did each region make relative
+            # to its starting value?
             r0=data[:,0:1].copy();r0=xp.where(xp.abs(r0)<1e-10,xp.ones_like(r0),r0);return(data-r0)/r0
         return data
     @staticmethod
@@ -103,6 +131,8 @@ class AnalysisEngine:
         n_rows,n_cols=A.shape
         k=min(n_components+n_oversampling, n_cols, n_rows)
         Omega=rng.standard_normal((n_cols,k)).astype(np.float32)
+        # Random projection finds a smaller subspace that captures most of the
+        # important variation before the exact SVD is run.
         Y=A@Omega
         for _ in range(n_power):
             Y=A@(A.T@Y)
@@ -128,6 +158,8 @@ class AnalysisEngine:
         else:active_idx=None;raw_active=raw
         # Center normalized temporal signals and compute PCA components.
         n_active=raw_active.shape[0];normed=self._normalize(raw_active)
+        # Subtract the average response at each time point so PCA focuses on
+        # spatial differences, not only the global illumination/echem response.
         mu=xp.mean(normed,axis=0,keepdims=True);data_c=normed-mu
         n_pca=min(self.n_pca,n_sub-1,n_active)
         data_c_np=np.asarray(data_c,dtype=np.float32)
@@ -147,6 +179,8 @@ class AnalysisEngine:
         else:full_loadings=U.T
         self.pca_loadings=full_loadings;self.pca_scores=xp.diag(S)@Vt
         # Initialize K-means with k-means++ style seeding in PCA space.
+        # In plain language: pick starting cluster centers that are spread out,
+        # then repeatedly assign each block to the nearest center.
         pca_coords=U;K=min(self.K,n_active)
         idx_km=xp.random.choice(n_active,size=1,replace=False);centroids=pca_coords[idx_km].copy()
         for _ in range(K-1):
@@ -169,6 +203,7 @@ class AnalysisEngine:
         else:full_labels=labels_active
         self.labels=full_labels
         # Average the original block traces for each cluster for downstream plots.
+        # These are the colored cluster traces shown against time and potential.
         self.cluster_means=xp.zeros((K,self._n_frames),dtype=xp.float32)
         for k in range(K):
             m=(full_labels==k)
@@ -188,6 +223,8 @@ class AnalysisEngine:
         return lbl.astype(np.int32).reshape(self.sp_h,self.sp_w)
     def get_cluster_overlay(self,alpha=80,highlight=None):
         # Build an RGBA overlay by expanding cluster labels from block grid to pixels.
+        # Each cluster gets a color, making spatial domains visible on top of the
+        # camera image.
         lbl=self.get_label_map()
         if lbl is None:return None
         K=self.K;bs=self.block_size;ov=np.zeros((self.sp_h*bs,self.sp_w*bs,4),dtype=np.uint8)
@@ -202,6 +239,8 @@ class AnalysisEngine:
     def get_pca_rgb_overlay(self,alpha=160):
         # Convert the first three PCA loading maps into RGB channels for visualizing
         # the dominant spatial response patterns.
+        # Unlike K-means, this is continuous: mixed colors mean mixed PCA
+        # response patterns.
         if self.pca_loadings is None:return None
         n_comp=min(3,self.pca_loadings.shape[0]);bs=self.block_size
         h_out=self.sp_h*bs;w_out=self.sp_w*bs;ov=np.zeros((h_out,w_out,4),dtype=np.uint8)

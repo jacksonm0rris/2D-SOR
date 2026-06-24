@@ -1,4 +1,11 @@
-"""ExportMixin methods for the main window."""
+"""ExportMixin methods for the main window.
+
+This mixin turns analyzed data into files the user can inspect outside the app.
+There are two export paths:
+
+* a ZIP containing plots and tab-delimited data tables,
+* TIFF stacks containing normalized frame images.
+"""
 from .dependencies import *
 from .numeric_utils import *
 from .analysis import *
@@ -17,6 +24,8 @@ class ExportMixin:
         return pg.mkPen(color='w', width=width)
 
     def _export_plots(self):
+        # Export the user-facing plots and the underlying numeric data into one
+        # ZIP file. This is meant for sharing and downstream analysis.
         if self._frame_E.size==0 and self._E_all.size==0:
             QtWidgets.QMessageBox.information(self,"Export","No data.");return
         path,_=QtWidgets.QFileDialog.getSaveFileName(self,"Export","sor_export.zip","ZIP (*.zip);;All (*)")
@@ -27,11 +36,14 @@ class ExportMixin:
         try:
             with zipfile.ZipFile(path,"w",zipfile.ZIP_DEFLATED) as zf:
                 def _sf(fig,name):
+                    # Save a matplotlib figure directly into the ZIP without
+                    # creating temporary PNG files on disk.
                     buf=io.BytesIO();fig.savefig(buf,format="png",dpi=200,bbox_inches="tight")
                     plt.close(fig);zf.writestr(name,buf.getvalue())
                 _E_exp = self._E_cv if self._E_cv.size > 0 else self._E_all
                 _I_exp = self._I_cv if self._I_cv.size > 0 else self._I_all
                 _t_exp = self._t_cv if self._t_cv.size > 0 else self._t_all
+                # CV plot and table: electrochemistry data by potential/current.
                 fig,ax=plt.subplots(figsize=(8,6));m=np.isfinite(_E_exp)&np.isfinite(_I_exp)
                 ax.plot(_E_exp[m],_I_exp[m],"b-",lw=1);ax.set_xlabel("E (V)");ax.set_ylabel("I (A)");ax.set_title("CV")
                 ax.ticklabel_format(axis="y",style="sci",scilimits=(-3,3));_sf(fig,"cv.png")
@@ -43,10 +55,14 @@ class ExportMixin:
                 if lf is None and self._memmap is not None and self._n_frames>0:
                     lf=np.asarray(self._memmap[-1],dtype=np.float32)
                 if lf is not None:
+                    # Last camera frame provides a quick visual reference for the
+                    # dataset orientation and sample appearance.
                     fig,ax=plt.subplots(figsize=(8,6));im=ax.imshow(lf,aspect="equal",cmap=self.cmap_cb.currentText())
                     plt.colorbar(im,ax=ax);ax.set_title("Last frame");_sf(fig,"camera.png")
                 roi=self._roi_intensity;n=min(roi.size,self._frame_t.size,self._frame_E.size)
                 if n>0:
+                    # ROI plots summarize the optical response through time and
+                    # versus electrochemical potential.
                     _t_m=np.isfinite(self._frame_t[:n])&np.isfinite(roi[:n])
                     _xt=self._frame_t[:n][_t_m];_yt=roi[:n][_t_m]
                     fig,ax=plt.subplots(figsize=(8,6))
@@ -75,6 +91,8 @@ class ExportMixin:
                     ax.set_ylabel("Normalized Reflectance",fontsize=12)
                     _sf(fig,"roi_e.png")
                     roi_raw=roi[:n]
+                    # Export both raw ROI and normalized/derived forms so the
+                    # user does not need to recompute them manually.
                     ref_val=roi_raw[0] if (roi_raw.size>0 and np.isfinite(roi_raw[0]) and roi_raw[0]!=0) else np.nan
                     roi_norm=roi_raw/ref_val if np.isfinite(ref_val) else np.full(n,np.nan)
                     t_col=self._frame_t[:n]
@@ -84,6 +102,8 @@ class ExportMixin:
                     pwr_col=self._stabilize_power(_pwr_raw)[:n] if _pwr_raw.size>=n else np.full(n,np.nan)
                     def _sg_w(m):w=max(11,int(round(0.01*m))|1);return min(w if w%2==1 else w+1,m if m%2==1 else m-1)
                     def _sg_d(y,x,w):
+                        # Savitzky-Golay derivative if SciPy is present; simple
+                        # gradient fallback otherwise.
                         try:
                             from scipy.signal import savgol_filter
                             dx=float(np.median(np.abs(np.diff(x))));dx=dx if dx>0 else 1.0
@@ -102,6 +122,8 @@ class ExportMixin:
                         ts=t_col[valid_t][idx_t];rs_t=roi_raw[valid_t][idx_t]
                         drdt_col[np.where(valid_t)[0][idx_t]]=_sg_d(rs_t,ts,_sg_w(len(rs_t)))
                     n_zones=len(self._zone_intensity)
+                    # Include every zone separately, plus the summed ROI, so
+                    # multi-zone experiments remain traceable after export.
                     zone_cols=[zi[:n] if zi.size>=n else np.full(n,np.nan)
                                for zi in self._zone_intensity]
                     zone_drr_cols=[zd[:n] if zd.size>=n else np.full(n,np.nan)
@@ -137,6 +159,8 @@ class ExportMixin:
                         ref_lines.append(row+"\n")
                     zf.writestr("reflectance_data.txt","".join(ref_lines))
                 if self._cl_means is not None and self._engine is not None:
+                    # PCA/K-means results are optional; include them only if
+                    # clustering was run.
                     eng=self._engine;means=self._cl_means;K=means.shape[0];nf=min(means.shape[1],n)
                     lbl=eng.get_label_map()
                     if lbl is not None:
@@ -166,6 +190,8 @@ class ExportMixin:
         self.traffic.setState(TrafficLight.GREEN)
 
     def _export_frames(self):
+        # Export image stacks as TIFFs. This is useful for ImageJ/Fiji or other
+        # image-analysis tools.
         if self._memmap is None or self._n_frames==0:
             QtWidgets.QMessageBox.information(self,"Export","No frames.");return
         if tifffile is None:QtWidgets.QMessageBox.critical(self,"Export","pip install tifffile");return
@@ -179,6 +205,8 @@ class ExportMixin:
             self.status_lbl.setText("Computing statistics...")
             QtWidgets.QApplication.processEvents()
             n_stat=min(50,self._n_frames)
+            # Estimate display scaling from a sample of frames so the normalized
+            # TIFF is not dominated by outliers.
             stat_idx=np.linspace(0,self._n_frames-1,n_stat,dtype=int)
             raw_vals=np.asarray(self._memmap[stat_idx],dtype=np.float32).ravel()
             raw_vals=raw_vals[np.isfinite(raw_vals)]
@@ -205,6 +233,7 @@ class ExportMixin:
                     ref_frame=np.asarray(self._memmap[0],dtype=np.float32)
                     safe_ref=np.where(np.abs(ref_frame)<1e-10,np.ones_like(ref_frame),ref_frame)
                     for i0 in range(0,self._n_frames,50):
+                        # Process frames in chunks to keep memory use bounded.
                         i1=min(self._n_frames,i0+50)
                         curr=np.asarray(self._memmap[i0:i1],dtype=np.float32)
                         drr=(curr-ref_frame[np.newaxis])/safe_ref[np.newaxis]
@@ -230,9 +259,12 @@ class ExportMixin:
         self.traffic.setState(TrafficLight.GREEN)
 
     def closeEvent(self,event):
+        # Close hardware/worker resources and remember display settings before
+        # the Qt window actually exits.
         if self._worker and self._worker.isRunning():self._worker.request_stop();self._worker.wait(3000)
         self._stop_frame_processor()
         self._memmap=None
+        # Persist user-visible display preferences for the next launch.
         d=self.cfg["display"];d["colormap"]=self.cmap_cb.currentText()
         d["auto_levels"]=str(self.auto_lev.isChecked()).lower()
         d["level_min"]=str(self.lmin.value());d["level_max"]=str(self.lmax.value())

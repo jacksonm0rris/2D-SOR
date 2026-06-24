@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Run the bundled JSON test scenarios as a repeatable performance suite."""
+"""Run the bundled JSON test scenarios as a repeatable performance suite.
+
+This is not part of normal interactive use. It is a developer/validation tool
+that runs synthetic scenarios through the same GUI code path, measures timing
+and memory, then writes a JSON report and a human-readable text summary.
+"""
 import argparse
 import ctypes
 import datetime as _dt
@@ -27,6 +32,8 @@ from sor_demo_modular.dialogs import TrafficLight
 
 def _process_memory_mb():
     """Return current process working-set memory in MB on Windows."""
+    # The benchmark currently targets the Windows development environment. On
+    # other platforms, memory is reported as NaN rather than failing the suite.
     if os.name != "nt":
         return math.nan
 
@@ -63,6 +70,8 @@ def _process_memory_mb():
 
 
 def _mean(values):
+    # Statistics helpers ignore NaN/inf so failed measurements do not poison the
+    # whole summary.
     vals = [float(v) for v in values if v is not None and math.isfinite(float(v))]
     return statistics.mean(vals) if vals else math.nan
 
@@ -88,6 +97,8 @@ def _percentile(values, pct):
 
 
 class BenchmarkRunner(QtCore.QObject):
+    """Runs scenarios one at a time and records performance measurements."""
+
     finished = QtCore.pyqtSignal(int)
 
     def __init__(self, window, scenarios, output_path, keep_temp=False,
@@ -110,12 +121,16 @@ class BenchmarkRunner(QtCore.QObject):
         self._mem_timer.timeout.connect(self._sample_memory)
 
     def start(self):
+        # Temporarily wrap selected DemoWindow methods so normal GUI behavior
+        # still happens while timing information is collected.
         self.window._on_frame = self._timed_on_frame
         self.window._on_frame_processed = self._timed_on_frame_processed
         self.window._on_err = self._window_error
         self._run_next()
 
     def _run_next(self):
+        # Start the next scenario. Each one gets a fresh temporary folder and
+        # frame binary so results do not overlap.
         self.index += 1
         if self.index >= len(self.scenarios):
             self._finish()
@@ -125,6 +140,8 @@ class BenchmarkRunner(QtCore.QObject):
         self.current_temp_dir = tempfile.mkdtemp(prefix="sor_benchmark_")
         bin_path = Path(self.current_temp_dir) / f"{scenario.stem}_frames.bin"
         self.current = {
+            # Lists collect per-frame samples; _finalize_current turns them into
+            # means, percentiles, max values, and totals.
             "scenario": scenario.name,
             "scenario_path": str(scenario),
             "frame_handler_ms": [],
@@ -161,6 +178,8 @@ class BenchmarkRunner(QtCore.QObject):
         self.window._worker.start()
 
     def _timed_on_frame(self, data):
+        # Measure how long the normal frame handler takes, then let it continue
+        # doing its usual GUI/live-preview work.
         if self.current is None:
             return self._orig_on_frame(data)
         prev_tw = self.current.get("_last_frame_wall")
@@ -177,6 +196,7 @@ class BenchmarkRunner(QtCore.QObject):
                                      int(data.get("frame_idx", -1)) + 1)
 
     def _timed_on_frame_processed(self, data):
+        # Capture timing information produced by the live ROI frame processor.
         if self.current is not None:
             worker_ms = data.get("worker_frame_ms")
             if worker_ms is not None and math.isfinite(float(worker_ms)):
@@ -187,6 +207,8 @@ class BenchmarkRunner(QtCore.QObject):
         return self._orig_on_frame_processed(data)
 
     def _worker_finished(self, _ds):
+        # After synthetic acquisition finishes, run the same Analyze workflow a
+        # user would click manually.
         if self.current is None:
             return
         self.current["acquisition_seconds"] = (
@@ -208,6 +230,8 @@ class BenchmarkRunner(QtCore.QObject):
         self.window.status_lbl.setText("Benchmark scenario failed.")
 
     def _run_analysis(self):
+        # Time the full deferred analysis pass, including ROI analysis and any
+        # enabled PCA/K-means settings.
         if self.current is None or self.current.get("error"):
             self._finalize_current()
             return
@@ -221,6 +245,7 @@ class BenchmarkRunner(QtCore.QObject):
         self._finalize_current()
 
     def _sample_memory(self):
+        # Timer callback that samples process memory while the scenario runs.
         if self.current is None:
             return
         mb = _process_memory_mb()
@@ -228,6 +253,7 @@ class BenchmarkRunner(QtCore.QObject):
             self.current["memory_samples_mb"].append(mb)
 
     def _finalize_current(self):
+        # Convert raw samples for one scenario into a compact result row.
         self._mem_timer.stop()
         if self.current is None:
             self._run_next()
@@ -277,6 +303,8 @@ class BenchmarkRunner(QtCore.QObject):
         QtCore.QTimer.singleShot(0, self._run_next)
 
     def _finish(self):
+        # Restore the original window methods and write both machine-readable and
+        # human-readable output files.
         self.window._on_frame = self._orig_on_frame
         self.window._on_frame_processed = self._orig_on_frame_processed
         self.window._on_err = self._orig_on_err
@@ -296,6 +324,7 @@ class BenchmarkRunner(QtCore.QObject):
         self.finished.emit(1 if self.errors else 0)
 
     def _summary(self):
+        # Average successful scenarios and count failures/dropped frames.
         numeric_fields = [
             "effective_fps",
             "on_frame_mean_ms",
@@ -327,6 +356,7 @@ class BenchmarkRunner(QtCore.QObject):
         return summary
 
     def _summary_text(self, payload):
+        # Plain-text table for quick reading without opening JSON.
         lines = [
             "2D-SOR benchmark suite",
             f"Created: {payload['created_at']}",
@@ -375,6 +405,8 @@ class BenchmarkRunner(QtCore.QObject):
 
 
 def parse_args():
+    # Default to the repository's bundled test scenarios and a new timestamped
+    # output folder.
     base_dir = Path(__file__).resolve().parent
     default_scenarios = base_dir.parent / "test scenarios"
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -410,6 +442,8 @@ def parse_args():
 
 
 def main():
+    # Create an offscreen Qt app by default, then drive the normal DemoWindow
+    # workflow programmatically.
     args = parse_args()
     scenarios = sorted(args.scenarios.glob("*.json"))
     if not scenarios:

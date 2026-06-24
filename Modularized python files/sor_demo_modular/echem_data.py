@@ -1,11 +1,14 @@
 """Electrochemistry data extraction helpers.
 
-Generated from sor_demo_v19_26-6-2.py during modularization.
+Different easy-biologic program objects expose voltage, current, and time using
+slightly different field names. These helpers convert those device-specific
+records into plain NumPy-friendly values used by the rest of the app.
 """
 from .dependencies import *
 from .numeric_utils import *
 
 def _parse_er(t):
+    # Parse a human-readable voltage/current range label into a numeric range.
     if "\u00b11" in t and "2.5" not in t:return 1.0
     if "2.5" in t:return 2.5
     if "5" in t and "2.5" not in t:return 5.0
@@ -13,6 +16,9 @@ def _parse_er(t):
     return 1.0
 
 def _extract_echem_point(d):
+    # Convert one easy-biologic data object into (potential, current).
+    # The object may be a namedtuple, dictionary, or regular object depending on
+    # which program generated it.
     try:
         if hasattr(d, "_asdict"):
             d_dict = d._asdict()
@@ -23,6 +29,8 @@ def _extract_echem_point(d):
     except Exception:
         d_dict = {}
     v = d_dict.get("voltage", d_dict.get("Ewe", d_dict.get("Ece")))
+    # Current can appear under several names. Prefer the averaged current when
+    # the device provides one.
     c = d_dict.get("<I>",
         d_dict.get("average_I",
             d_dict.get("I",
@@ -30,17 +38,23 @@ def _extract_echem_point(d):
     return safe_float(v), safe_float(c)
 
 def _extract_dev_time(d):
+    # Device time is useful for spacing points inside a batch before assigning
+    # wall-clock timestamps.
     tt=getattr(d,"time",None)
     if tt is None and isinstance(d,dict):tt=d.get("time",d.get("t"))
     return safe_float(tt,np.nan)
 
 def _step_average_current(Ea, Ia, step_v=None):
+    # CV data may contain repeated measurements at nearly the same potential.
+    # For plotting, replace each small potential plateau with its mean current.
     Ea = np.asarray(Ea, dtype=np.float64)
     Ia = np.asarray(Ia, dtype=np.float64)
     n = len(Ea)
     if n < 2:
         return Ia.copy()
     if step_v is None or step_v <= 0:
+        # Estimate the potential step from the median nonzero change if the
+        # configured step is missing.
         dE = np.abs(np.diff(Ea))
         pos = dE[dE > 0]
         step_v = float(np.median(pos)) if pos.size > 0 else 1e-4
@@ -48,6 +62,7 @@ def _step_average_current(Ea, Ia, step_v=None):
     Ia_avg = Ia.copy()
     i = 0
     while i < n:
+        # Gather consecutive points close to the same potential.
         j = i + 1
         while j < n and abs(Ea[j] - Ea[i]) < half:
             j += 1
@@ -60,6 +75,9 @@ def _step_average_current(Ea, Ia, step_v=None):
     return Ia_avg
 
 def _stamp_batch(batch, twe, t_now):
+    # Assign wall-clock timestamps to a batch of newly received echem points.
+    # This is the key step that later lets camera frames be matched to voltage
+    # and current by interpolation.
     nb = len(batch)
     prev_tw = twe[-1] if twe else (t_now - 0.001 * nb)
     t_now = max(t_now, prev_tw + 1e-6 * nb)
@@ -67,10 +85,13 @@ def _stamp_batch(batch, twe, t_now):
     dev_arr = np.array(dev_times, dtype=np.float64)
     wall_span = max(t_now - prev_tw, 1e-6)
     if np.all(np.isfinite(dev_arr)) and nb > 1:
+        # A negative jump means the device timer reset between program phases.
         resets = np.where(np.diff(dev_arr) < 0)[0] + 1
     else:
         resets = np.array([], dtype=int)
     if resets.size == 0:
+        # If device times are monotonic, spread the points across the wall-clock
+        # interval according to their device-time spacing.
         if nb > 1 and np.all(np.isfinite(dev_arr)) and dev_arr[-1] > dev_arr[0]:
             span = dev_arr[-1] - dev_arr[0]
             offsets = (dev_arr - dev_arr[0]) / span * wall_span
@@ -79,6 +100,7 @@ def _stamp_batch(batch, twe, t_now):
             point_walls = np.linspace(
                 prev_tw + wall_span / max(nb, 1), t_now, nb)
     else:
+        # If the timer reset, split the batch into monotonic sub-batches.
         seg_starts = np.concatenate([[0], resets, [nb]])
         seg_sizes  = np.diff(seg_starts)
         point_walls = np.empty(nb, dtype=np.float64)
@@ -99,6 +121,7 @@ def _stamp_batch(batch, twe, t_now):
                     seg_prev + seg_wall / max(n_seg, 1), seg_t_now, n_seg)
             seg_prev = seg_t_now
     for i in range(1, nb):
+        # Enforce strictly increasing wall times so interpolation stays stable.
         if point_walls[i] <= point_walls[i - 1]:
             point_walls[i] = point_walls[i - 1] + 1e-6
     return dev_times, point_walls

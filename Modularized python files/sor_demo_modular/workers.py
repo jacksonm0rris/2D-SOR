@@ -1,6 +1,15 @@
 """Live acquisition and test-data worker threads.
 
-Generated from sor_demo_v19_26-6-2.py during modularization.
+Workers run outside the GUI thread. That means they can talk to the potentiostat,
+camera, and power meter without freezing the window.
+
+There are two acquisition paths:
+
+* LiveCVWorker talks to hardware and saves real camera frames.
+* TestWorker generates synthetic electrochemistry and synthetic camera frames.
+
+Both paths emit the same kind of signals so AcquisitionMixin can treat them
+almost identically.
 """
 from .dependencies import *
 from .numeric_utils import *
@@ -8,6 +17,9 @@ from .analysis import *
 from .echem_data import *
 
 class _BaseCVWorker(QtCore.QThread):
+    """Base class for live hardware acquisition workers."""
+
+    # These signals are how worker threads safely communicate with the GUI.
     new_echem  = QtCore.pyqtSignal(object)
     new_frame  = QtCore.pyqtSignal(object)
     status_msg = QtCore.pyqtSignal(str)
@@ -23,12 +35,17 @@ class _BaseCVWorker(QtCore.QThread):
         self.bin_path = bin_path
 
     def request_stop(self):
+        # The run loop checks this flag and exits cooperatively.
         self._stop = True
 
     def _build_sequence(self, blp, bl, ocv):
+        # Subclasses decide which potentiostat programs to run.
         raise NotImplementedError
 
     def run(self):
+        # This is the main live-acquisition procedure. It starts the potentiostat
+        # sequence and camera capture together, then timestamps both streams so
+        # frames can later be aligned with potential/current.
         ok, ebl, blp, err = try_import_ebl()
         if not ok:
             self.finished_err.emit(f"easy-biologic:\n{err}"); return
@@ -36,6 +53,7 @@ class _BaseCVWorker(QtCore.QThread):
             self.finished_err.emit(CAM_IMPORT_ERROR or "Camera missing"); return
         _ensure_dll()
         cam = self.cfg["camera"]; pmc = self.cfg["power_meter"]
+        # Pull camera and power-meter settings from the setup dialog config.
         exp_us   = int(cam.get("exposure_us", "7000"))
         ci       = int(cam.get("camera_index", "0"))
         bf       = int(cam.get("bin_factor", "1"))
@@ -47,6 +65,8 @@ class _BaseCVWorker(QtCore.QThread):
         os.makedirs(self.sd, exist_ok=True)
         fp = self.bin_path if self.bin_path else os.path.join(self.sd, "frames_f32.bin")
         sink = FrameFileSink(fp); bl = None; pm = None
+        # E/I/t arrays collect potentiostat samples. twe stores wall-clock times
+        # used for camera/echem alignment. ftw/fpw store frame times and power.
         Ea, Ia, ta, twe, Ephase = [], [], [], [], []
         ftw, fpw = [], []
         seq_exc = {"e": None}
@@ -57,6 +77,8 @@ class _BaseCVWorker(QtCore.QThread):
             bl.connect(None, None)
             ocv = 0.0
             if self._use_ocv():
+                # If enabled, measure open-circuit voltage and offset the
+                # programmed voltages relative to that measured value.
                 try:
                     if hasattr(blp, "OCV"):
                         op = blp.OCV(bl, {"duration": 2.0}, channels=[0])
@@ -69,6 +91,8 @@ class _BaseCVWorker(QtCore.QThread):
             current_phase = {"label": "init"}
 
             def _run_sequence():
+                # Run the potentiostat programs sequentially in a Python thread
+                # while the outer loop polls both echem data and camera frames.
                 try:
                     for label, prog in sequence:
                         if self._stop: break
@@ -108,6 +132,7 @@ class _BaseCVWorker(QtCore.QThread):
 
                     while seq_thread.is_alive() and not self._stop:
                         now = time.time()
+                        # Poll every program for newly available echem points.
                         for label, prog in sequence:
                             if prog is None: continue
                             t_now = time.time()
@@ -121,10 +146,15 @@ class _BaseCVWorker(QtCore.QThread):
                                 batch = cd[seen:]
                                 finite_batch = []
                                 for j, d in enumerate(batch):
+                                    # Device objects can vary by program type,
+                                    # so echem_data.py normalizes field names.
                                     v, c = _extract_echem_point(d)
                                     if np.isfinite(v) and np.isfinite(c):
                                         finite_batch.append((j, d, v, c))
                                 if finite_batch:
+                                    # Assign wall-clock timestamps to this
+                                    # batch. These are later used to interpolate
+                                    # E/I onto frame times.
                                     dev_times, point_walls = _stamp_batch(
                                         [d for _, d, _, _ in finite_batch], twe, t_now)
                                     if "Initial" in label or "initial" in label:
@@ -141,6 +171,9 @@ class _BaseCVWorker(QtCore.QThread):
                                 prog._seen_pts = len(cd)
 
                         if (now - lee) > 0.15 and Ea:
+                            # Emit live echem arrays a few times per second for
+                            # the CV preview. The final dataset is emitted at
+                            # completion too.
                             _Ea_arr = np.array(Ea, dtype=np.float64)
                             _Ia_arr = np.array(Ia, dtype=np.float64)
                             try:
@@ -157,6 +190,8 @@ class _BaseCVWorker(QtCore.QThread):
                             lee = now
 
                         if (now - lft) * 1000 >= cap_int:
+                            # Trigger one camera frame at the configured capture
+                            # interval, then wait up to frame_wait_ms for it.
                             try: camera.issue_software_trigger()
                             except: pass
                             t0g = time.time()
@@ -164,12 +199,16 @@ class _BaseCVWorker(QtCore.QThread):
                                 fr = camera.get_pending_frame_or_null()
                                 if fr is not None:
                                     img = np.asarray(fr.image_buffer).astype(np.float32, copy=False)
+                                    # Optional camera binning reduces frame size
+                                    # before saving and display.
                                     if bf > 1: img = _bin_2d(img, bf, bm)
                                     sink.append(img); tw = time.time(); pwr = np.nan
                                     if pm:
                                         try: pwr = float(pm.get_power())
                                         except: pass
                                     ftw.append(tw); fpw.append(pwr)
+                                    # Label frames by experiment phase so plots
+                                    # can distinguish holds from CV scans.
                                     _lbl = current_phase["label"]
                                     if "Initial" in _lbl or "initial" in _lbl:
                                         _phase = "hold_init"
@@ -204,6 +243,8 @@ class _BaseCVWorker(QtCore.QThread):
 
             sink.close()
             if seq_exc["e"]: raise RuntimeError(str(seq_exc["e"]))
+            # Build final NumPy arrays and align electrochemistry values to each
+            # camera frame by interpolation.
             etw = np.array(twe, dtype=np.float64)
             eE  = np.array(Ea,  dtype=np.float64)
             eI  = np.array(Ia,  dtype=np.float64)
@@ -214,6 +255,8 @@ class _BaseCVWorker(QtCore.QThread):
             except Exception:
                 pass
             f_tw = np.array(ftw, dtype=np.float64)
+            # This dictionary shape is the common dataset contract used by
+            # AcquisitionMixin, datasets.py, analysis, and export.
             self.finished_ok.emit({
                 "frames_path":  fp,
                 "frames_count": sink.count,
@@ -230,6 +273,7 @@ class _BaseCVWorker(QtCore.QThread):
             except: pass
             self.finished_err.emit(f"{e}\n\n{traceback.format_exc()}")
         finally:
+            # Always try to close hardware handles, even after errors.
             if pm:
                 try: pm.close()
                 except: pass
@@ -246,6 +290,8 @@ class _BaseCVWorker(QtCore.QThread):
 
 class LiveCVWorker(_BaseCVWorker):
     def _build_sequence(self, blp, bl, ocv):
+        # Build the actual potentiostat program list:
+        # optional initial hold, CV scan, optional final hold.
         pot = self.cfg["potentiostat"]
         vs  = self._use_ocv()
         exp = pot.get("experiment_type", EXP_CV)
@@ -259,6 +305,7 @@ class LiveCVWorker(_BaseCVWorker):
         t_final = float(pot.get("hold_t_final", "0.0"))
 
         def _ca(voltage, duration, label):
+            # CA means chronoamperometry: hold one voltage for a duration.
             if duration <= 0:
                 return label, None
             prog = blp.CA(
@@ -271,6 +318,7 @@ class LiveCVWorker(_BaseCVWorker):
             return label, prog
 
         cv_params = {
+            # easy-biologic expects these names for a CV program.
             "start":   start_v,
             "end":     upper_v,
             "E2":      lower_v,
@@ -294,27 +342,40 @@ class LiveCVWorker(_BaseCVWorker):
 LiveCVAWorker = LiveCVWorker
 
 def load_test_scenario(path):
+    # Test scenarios describe synthetic image regions and how they respond to E.
     with open(path,"r",encoding="utf-8") as f:return json.load(f)
 
+def default_test_scenario():
+    # Default scenario used when the user cancels the scenario picker.
+    return {"background":200,"noise_std":10,"regions":[{"type":"gaussian","cx":0.5,"cy":0.5,"sigma":0.12,"amplitude":800,
+        "modulation":{"type":"faradaic","E_peak":0.1,"width":0.02,"baseline":1.0,"peak_amplitude":0.3},
+        "movement":{"dx_per_E":0.8}}]}
+
 def render_scenario_frame(sc,E,tf,h,w,yy,xx):
+    # Build one synthetic camera frame for a given potential E and fractional
+    # experiment time tf. Regions can be Gaussian spots, rectangles, or Voronoi
+    # domains with voltage-dependent modulation.
     bg=float(sc.get("background",200));noise=float(sc.get("noise_std",10))
     frame=np.full((h,w),bg,dtype=np.float32)
     for reg in sc.get("regions",[]):
         amp=float(reg.get("amplitude",500));mod=_cmod(reg.get("modulation",{}),E,tf)
         rt=reg.get("type","gaussian")
         if rt=="gaussian":
+            # Gaussian regions simulate a smooth optical feature.
             cxf=float(reg.get("cx",0.5));cyf=float(reg.get("cy",0.5))
             sig=float(reg.get("sigma",0.1))*min(h,w)
             cx=cxf*w;cy=cyf*h;mv=reg.get("movement",{})
             if mv:cx+=float(mv.get("dx_per_E",0))*E*w;cy+=float(mv.get("dy_per_E",0))*E*h
             r2=((xx-cx)**2+(yy-cy)**2).astype(np.float32);frame+=amp*mod*np.exp(-r2/(2*sig**2))
         elif rt=="rect":
+            # Rectangular regions are useful for simple controlled tests.
             x0=max(0,min(w,int(float(reg.get("x0",0))*w)));y0=max(0,min(h,int(float(reg.get("y0",0))*h)))
             x1=max(0,min(w,int(float(reg.get("x1",1))*w)));y1=max(0,min(h,int(float(reg.get("y1",1))*h)))
             frame[y0:y1,x0:x1]+=amp*mod
         elif rt=="voronoi":pass
     vr=[r for r in sc.get("regions",[]) if r.get("type")=="voronoi"]
     if vr:
+        # Voronoi regions simulate domain-like patches, such as grains.
         ck=f"_vc_{h}_{w}"
         if ck not in sc:
             seeds=np.array([(float(r.get("cy",0.5))*h,float(r.get("cx",0.5))*w) for r in vr],dtype=np.float32)
@@ -327,6 +388,8 @@ def render_scenario_frame(sc,E,tf,h,w,yy,xx):
     return frame
 
 def _cmod(cfg,E,tf):
+    # Return a multiplier for a synthetic region. "faradaic" makes a peak-like
+    # response around E_peak, which is useful for CV-style demo data.
     mt=cfg.get("type","constant")
     if mt=="constant":return float(cfg.get("value",1.0))
     elif mt=="sine":return float(cfg.get("offset",1))+float(cfg.get("amplitude",0.3))*np.sin(2*np.pi*float(cfg.get("frequency",1))*tf+float(cfg.get("phase",0)))
@@ -337,6 +400,8 @@ def _cmod(cfg,E,tf):
 
 
 class TestWorker(QtCore.QThread):
+    """Synthetic worker that mimics live acquisition without hardware."""
+
     new_echem=QtCore.pyqtSignal(object);new_frame=QtCore.pyqtSignal(object)
     status_msg=QtCore.pyqtSignal(str);progress=QtCore.pyqtSignal(int,int)
     finished_ok=QtCore.pyqtSignal(object);finished_err=QtCore.pyqtSignal(str)
@@ -351,9 +416,9 @@ class TestWorker(QtCore.QThread):
             if self.sp and os.path.isfile(self.sp):
                 sc=load_test_scenario(self.sp);self.status_msg.emit(f"Scenario: {os.path.basename(self.sp)}")
             if sc is None:
-                sc={"background":200,"noise_std":10,"regions":[{"type":"gaussian","cx":0.5,"cy":0.5,"sigma":0.12,"amplitude":800,
-                    "modulation":{"type":"faradaic","E_peak":0.1,"width":0.02,"baseline":1.0,"peak_amplitude":0.3},
-                    "movement":{"dx_per_E":0.8}}]}
+                # Default scenario: one Gaussian feature with a peak-like
+                # electrochemical response near 0.1 V.
+                sc=default_test_scenario()
                 self.status_msg.emit("Test (default)...")
             os.makedirs(self.sd,exist_ok=True)
             fp=self.bin_path if self.bin_path else os.path.join(self.sd,"frames_f32.bin")
@@ -361,16 +426,21 @@ class TestWorker(QtCore.QThread):
             pot=self.cfg["potentiostat"];sv=float(pot.get("start_v","0"));uv=float(pot.get("upper_v","0.25"))
             lv=float(pot.get("lower_v","-0.1"));step=max(float(pot.get("step_v","0.001")),1e-6)
             sr=max(float(pot.get("scan_rate","0.02")),1e-6)
+            # Create a triangular CV waveform: start -> upper -> lower -> start.
             seg=np.concatenate([np.arange(sv,uv,step),np.arange(uv,lv,-step),np.arange(lv,sv,step)])
             if seg.size==0:seg=np.linspace(-0.1,0.25,self.np_)
             if seg.size<self.np_:seg=np.tile(seg,int(np.ceil(self.np_/seg.size)))
             Ew=seg[:self.np_];dt=step/sr;tw=np.arange(self.np_)*dt
             dE=np.gradient(Ew,tw)
+            # Synthetic current combines capacitive current, a Gaussian faradaic
+            # peak, scan direction, and a little random noise.
             Iw=20e-6*dE+50e-6*np.exp(-((Ew-0.1)**2)/(2*0.02**2))*np.sign(dE)+np.random.normal(0,1e-7,self.np_)
             Ea,Ia,ta,twe=[],[],[],[];ftw_,fpw_=[],[]
             h,w=self.fhw;yy,xx=np.mgrid[0:h,0:w];cf=0;t0=time.time();fi=1.0/max(self.fr,1.0);ei=0;lee=0.0;lft=0.0
             while ei<self.np_ and not self._stop:
                 now=time.time();elapsed=now-t0;bs_=ei
+                # Release echem points according to elapsed real time so the GUI
+                # experiences a live-looking stream.
                 while ei<self.np_ and ei*dt<=elapsed:
                     Ea.append(float(Ew[ei]));Ia.append(float(Iw[ei]));ta.append(float(tw[ei]));ei+=1
                 bc=ei-bs_
@@ -380,6 +450,8 @@ class TestWorker(QtCore.QThread):
                     self.new_echem.emit({"E":np.array(Ea,dtype=np.float64),"I":np.array(Ia,dtype=np.float64),
                         "t":np.array(ta,dtype=np.float64),"t_wall":np.array(twe,dtype=np.float64)});lee=now
                 if (now-lft)>=fi and Ea:
+                    # Render and emit a synthetic frame at the requested frame
+                    # rate, using the most recent potential value.
                     frame=render_scenario_frame(sc,Ea[-1],ei/max(self.np_,1),h,w,yy,xx)
                     sink.append(frame);twn=time.time();pwr=0.5+0.01*np.random.randn()
                     ftw_.append(twn);fpw_.append(pwr)
@@ -389,6 +461,8 @@ class TestWorker(QtCore.QThread):
             if Ea:self.new_echem.emit({"E":np.array(Ea,dtype=np.float64),"I":np.array(Ia,dtype=np.float64),
                 "t":np.array(ta,dtype=np.float64),"t_wall":np.array(twe,dtype=np.float64)})
             sink.close()
+            # Match echem values to frame times using the same interpolation
+            # contract as real hardware acquisition.
             etw=np.array(twe,dtype=np.float64);eE=np.array(Ea,dtype=np.float64)
             eI=np.array(Ia,dtype=np.float64);et=np.array(ta,dtype=np.float64);f_tw=np.array(ftw_,dtype=np.float64)
             self.finished_ok.emit({"frames_path":fp,"frames_count":sink.count,"frames_hw":sink.shape_hw,

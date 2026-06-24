@@ -2,7 +2,7 @@
 
 ## Set up cell
 Works best for cell with flat bottom, no other features inside cell body
-1. Fil cell with electrolyte. Add counter electrode, add reference electrode, insert argon tube into bubbler. Bubble electrolyte for 20 minutes, then pull straw out of solution to fil headspace with argon.
+1. Fill cell with electrolyte. Add counter electrode, add reference electrode, insert argon tube into bubbler. Bubble electrolyte for 20 minutes, then pull straw out of solution to fil headspace with argon.
 2. For single crystal Au(111): Insert into holder, flame anneal, insert into argon headspace of cell to cool. Wait 5 minutes. Lower crystal to make contact with elecrolyte surface, then withdraw to make meniscus. Take care not to break the mensicus.
 3. For CVs, attach blue wire to counter electrode, white to reference, red to working electrode. Align with camera, LED.
 

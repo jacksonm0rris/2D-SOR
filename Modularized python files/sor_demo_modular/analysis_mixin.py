@@ -1,4 +1,9 @@
-"""AnalysisMixin methods for the main window."""
+"""AnalysisMixin methods for the main window.
+
+This mixin is the GUI side of PCA/K-means analysis. It reads analysis settings
+from widgets, calls AnalysisEngine in analysis.py, and puts the results back on
+the image and ROI plots.
+"""
 from .dependencies import *
 from .numeric_utils import *
 from .analysis import *
@@ -10,6 +15,8 @@ from .dialogs import *
 
 class AnalysisMixin:
     def _on_an_toggle(self,checked):
+        # The Enable button does not run analysis by itself unless results are
+        # already available. A fresh dataset still requires clicking Analyze.
         if isinstance(checked,bool) and not checked:
             self._an_active=False
             self.cl_overlay.setOpacity(0.5);self.pca_overlay.setOpacity(0.6)
@@ -20,6 +27,8 @@ class AnalysisMixin:
         else:self.an_var.setText("(click Analyze to run clustering)")
 
     def _on_an_setting_changed(self,*_):
+        # Changing K, PCA count, block size, stride, or normalization invalidates
+        # the previous PCA/K-means result.
         self._engine=None
         self._rebuild_cbs()
         if self._an_active:
@@ -31,6 +40,7 @@ class AnalysisMixin:
         self._on_an_setting_changed()
 
     def _on_cl_sel(self):
+        # Checkboxes choose which cluster mean traces are drawn and highlighted.
         self._cl_sel={i for i,cb in enumerate(self.an_cbs) if cb.isChecked()}
         self._update_an_plots()
         if self._engine is not None and self._an_active:
@@ -38,6 +48,8 @@ class AnalysisMixin:
             if ov is not None:self.cl_overlay.setImage(ov)
 
     def _on_rgb(self):
+        # PCA RGB is an optional overlay showing the first three PCA patterns as
+        # red, green, and blue image channels.
         if self._an_active and self._engine is not None:
             if self.an_rgb.isChecked():
                 rgb=self._engine.get_pca_rgb_overlay(alpha=140)
@@ -45,11 +57,14 @@ class AnalysisMixin:
             else:self.pca_overlay.setVisible(False)
 
     def _clear_an(self):
+        # Remove cluster traces from the secondary axes on ROI plots.
         for c in self._cl_curves_t.values():self.roi_t_vb2.removeItem(c)
         for c in self._cl_curves_e.values():self.roi_e_vb2.removeItem(c)
         self._cl_curves_t.clear();self._cl_curves_e.clear()
 
     def _ensure_an(self,K):
+        # Keep plot curve objects synchronized with the currently selected
+        # cluster checkboxes.
         for k in list(self._cl_curves_t):
             if k not in self._cl_sel:
                 self.roi_t_vb2.removeItem(self._cl_curves_t.pop(k))
@@ -62,11 +77,14 @@ class AnalysisMixin:
                 self._cl_curves_e[k]=pg.PlotDataItem([],[],pen=pen);self.roi_e_vb2.addItem(self._cl_curves_e[k])
 
     def _run_an(self):
+        # Run PCA/K-means using the current GUI settings. This is normally called
+        # by AcquisitionMixin._on_analyze after ROI analysis is complete.
         if not self._an_active or self._frames_hw is None or self._n_frames<3:return
         self.traffic.setState(TrafficLight.YELLOW);QtWidgets.QApplication.processEvents()
         h,w=self._frames_hw;K=self.an_k.value();np_=self.an_pca.value();nm=self.an_norm.currentText()
         stride=getattr(self,'an_stride',None);stride=stride.value() if stride else 1
         _bs=getattr(self,'an_block',None);_bs=_bs.value() if _bs else 4
+        # Recreate the engine only when settings that affect the math changed.
         if (self._engine is None or self._engine.K!=K or self._engine.n_pca!=np_
                 or self._engine.norm_mode!=nm or self._engine.frame_stride!=stride
                 or self._engine.block_size!=_bs):
@@ -74,6 +92,8 @@ class AnalysisMixin:
                                         frame_stride=stride)
         eng=self._engine
         if self.an_roi_only.isChecked():
+            # ROI-only analysis restricts PCA/K-means to the selected image
+            # region instead of using the whole frame.
             _rmask=self._zone_mask_in_original(self.roi,self._frames_hw)
             _rows=np.where(np.any(_rmask,axis=1))[0]
             _cols=np.where(np.any(_rmask,axis=0))[0]
@@ -90,6 +110,8 @@ class AnalysisMixin:
             stride=getattr(self,'an_stride',None);stride=stride.value() if stride else 1
             _bs=getattr(self,'an_block',None);_bs=_bs.value() if _bs else 4
             if (eng.frame_h!=_rot_hw[0] or eng.frame_w!=_rot_hw[1]):
+                # If rotation changes the analyzed shape, rebuild the engine
+                # using the rotated dimensions.
                 eng=AnalysisEngine(_rot_hw[0],_rot_hw[1],block_size=_bs,
                                    K=K,n_pca=np_,norm_mode=nm,frame_stride=stride)
                 self._engine=eng
@@ -105,6 +127,7 @@ class AnalysisMixin:
                                  rotate_fn=self._apply_rotation)
         ok=eng.run()
         if not ok:self.traffic.setState(TrafficLight.GREEN);return
+        # Push computed images and numbers back into the GUI.
         self.cl_overlay.setOpacity(0.5);self.pca_overlay.setOpacity(0.6)
         ov=eng.get_cluster_overlay(alpha=80,highlight=self._cl_sel)
         if ov is not None:self.cl_overlay.setImage(ov);self.cl_overlay.setVisible(True)
@@ -119,6 +142,7 @@ class AnalysisMixin:
         self.traffic.setState(TrafficLight.GREEN)
 
     def _update_an_plots(self):
+        # Draw selected cluster mean traces against time and potential.
         means=self._cl_means
         if means is None or not self._an_active:return
         K=means.shape[0];self._ensure_an(K)

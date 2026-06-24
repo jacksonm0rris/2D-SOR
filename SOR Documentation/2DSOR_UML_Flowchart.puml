@@ -1,0 +1,123 @@
+@startuml
+title 2D-SOR Normal Use UML Activity Flow
+
+start
+
+partition "Start" {
+  #E8F1FF:Run launch_sor_demo.py\n[launch_sor_demo.py];
+  #D9ECFF:Call sor_demo_modular.app.main()\n[app.py];
+  #D9ECFF:Parse CLI options\nnormal GUI, --test, or --load\n[app.py];
+  #D9ECFF:Create QApplication\n[app.py];
+  #D9ECFF:Create and show DemoWindow\n[app.py];
+  #E6F4EA:Build GUI, load settings,\ninitialize plots and controls\n[main_window.py];
+}
+
+partition "Processing" {
+  while (Waiting for user action?) is (Continue)
+    if (Setup clicked?) then (Yes)
+      #FFF0D9:Open setup dialog\n[acquisition_mixin.py];
+      #FFF8D8:Update experiment, camera,\ndisplay, reference, and power settings\n[dialogs.py / settings.py];
+    elseif (Run clicked?) then (Live experiment)
+      #FFF0D9:Prompt for output JSON path\n[acquisition_mixin.py];
+      #FFF0D9:Create frame binary path\n[acquisition_mixin.py];
+      #FFF0D9:Clear previous data\n[acquisition_mixin.py];
+      #FFF0D9:Start frame processor thread\n[acquisition_mixin.py];
+      #FFE1DF:Start LiveCVWorker or LiveCVAWorker\n[workers.py];
+      repeat
+        #FFE1DF:Acquire electrochemistry points\nand camera frames\n[workers.py / echem_data.py];
+        #FFE1DF:Emit progress, status,\nechem, and frame signals\n[workers.py];
+        #FFF8D8:Update live CV and frame display\n[acquisition_mixin.py / cv_plot_mixin.py];
+        #FFF0D9:Queue frame for ROI processing\n[acquisition_mixin.py];
+        #DFF7F4:Update live ROI plot\n[acquisition_mixin.py / zones_mixin.py];
+      repeat while (Acquisition still running?) is (Yes)
+      if (Finished successfully?) then (Yes)
+        #FFF0D9:Open frame binary as memory map\n[acquisition_mixin.py];
+        #FFF0D9:Display last frame\n[acquisition_mixin.py];
+        #EEE2FF:Save sor_dataset.json metadata\n[datasets.py];
+        #FFF0D9:Enable Analyze\n[acquisition_mixin.py];
+      else (Stop or error)
+        #FFF0D9:Stop worker and reset controls\n[acquisition_mixin.py];
+        #FFF0D9:Show status or error message\n[acquisition_mixin.py];
+      endif
+    elseif (Test clicked or --test?) then (Synthetic test)
+      #FFF0D9:Select or receive scenario JSON\n[acquisition_mixin.py];
+      #FFF0D9:Create temporary test output folder\n[acquisition_mixin.py];
+      #FFF0D9:Start frame processor thread\n[acquisition_mixin.py];
+      #FFE1DF:Start TestWorker\n[workers.py];
+      repeat
+        #FFE1DF:Generate synthetic electrochemistry\nand camera frames\n[workers.py];
+        #FFE1DF:Emit progress, status,\nechem, and frame signals\n[workers.py];
+        #FFF8D8:Update live CV, frame display,\nand live ROI plot\n[acquisition_mixin.py / cv_plot_mixin.py / zones_mixin.py];
+      repeat while (Test still running?) is (Yes)
+      #FFF0D9:Open frame binary as memory map\n[acquisition_mixin.py];
+      #FFF0D9:Display last frame\n[acquisition_mixin.py];
+      #EEE2FF:Save dataset metadata\n[datasets.py];
+      #FFF0D9:Enable Analyze\n[acquisition_mixin.py];
+    elseif (Load clicked or --load?) then (Existing dataset)
+      #FFF0D9:Select dataset JSON or folder\n[acquisition_mixin.py];
+      #EEE2FF:Load sor_dataset.json metadata\n[datasets.py];
+      #EEE2FF:Locate frame binary\n[datasets.py];
+      #FFF0D9:Create memory map\n[acquisition_mixin.py];
+      #FFF8D8:Display last frame and update CV\n[acquisition_mixin.py / cv_plot_mixin.py];
+      #FFF0D9:Enable Analyze\n[acquisition_mixin.py];
+    elseif (Export clicked?) then (Export)
+      #E8F7DC:Export plots/data ZIP or\nnormalized frame TIFFs\n[export_mixin.py];
+    else (Close)
+      break
+    endif
+  endwhile
+}
+
+partition "Analysis" {
+  if (Analyze clicked?) then (Yes)
+    #FFF0D9:Clear stale analysis caches\n[acquisition_mixin.py];
+    #FFF0D9:Set status to Analyzing\n[acquisition_mixin.py];
+    #DFF7F4:Analyze zones from memory-mapped frames\n[zones_mixin.py];
+    #DFF7F4:Apply optional power correction\n[zones_mixin.py / cv_plot_mixin.py];
+    #DFF7F4:Apply optional reference normalization\n[zones_mixin.py];
+    #DFF7F4:Compute ROI, dR/R,\nand per-zone traces\n[zones_mixin.py];
+    #F7E6FF:Update CV, ROI vs time,\nROI vs potential, cycles, and smoothing\n[cv_plot_mixin.py / numeric_utils.py];
+    if (PCA/clustering enabled?) then (Yes)
+      #E7EDFF:Create or reuse AnalysisEngine\n[analysis_mixin.py];
+      #DFF0FF:Block-average frames\n[analysis.py];
+      #DFF0FF:Apply optional frame rotation\n[analysis.py];
+      if (ROI-only analysis?) then (Yes)
+        #DFF0FF:Restrict block grid to ROI\n[analysis.py];
+      else (No)
+        #DFF0FF:Use full block grid\n[analysis.py];
+      endif
+      #DFF0FF:Normalize traces\nraw, z-score, or dR/R\n[analysis.py];
+      #DFF0FF:Run randomized SVD PCA\n[analysis.py];
+      #DFF0FF:Cluster PCA coordinates with K-means\n[analysis.py];
+      #DFF0FF:Build cluster label map\n[analysis.py];
+      #DFF0FF:Compute cluster mean traces\n[analysis.py];
+      #DFF0FF:Create cluster overlay,\nPCA RGB overlay, and explained variance\n[analysis.py];
+      #E7EDFF:Update analysis plots\n[analysis_mixin.py];
+    else (No)
+      #E7EDFF:Skip PCA/clustering branch\n[analysis_mixin.py];
+    endif
+    #FFF0D9:Set status to Analysis complete\n[acquisition_mixin.py];
+  else (No)
+    #E6F4EA:Data remains available for inspection,\nzone edits, export, or later analysis\n[main_window.py / mixins];
+  endif
+}
+
+stop
+
+legend right
+  |= Color |= Primary file |
+  |<#E8F1FF>| launch_sor_demo.py |
+  |<#D9ECFF>| app.py |
+  |<#E6F4EA>| main_window.py |
+  |<#FFF0D9>| acquisition_mixin.py |
+  |<#FFE1DF>| workers.py / echem_data.py |
+  |<#EEE2FF>| datasets.py |
+  |<#DFF7F4>| zones_mixin.py |
+  |<#F7E6FF>| cv_plot_mixin.py / numeric_utils.py |
+  |<#E7EDFF>| analysis_mixin.py |
+  |<#DFF0FF>| analysis.py |
+  |<#E8F7DC>| export_mixin.py |
+  |<#FFF8D8>| multiple files |
+endlegend
+
+@enduml
