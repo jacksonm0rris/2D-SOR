@@ -118,10 +118,16 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
         self._cv_last_draw=0.0
         self._live_ftw_arr=np.full(8192,np.nan,dtype=np.float64)
         self._live_roi_arr=np.full(8192,np.nan,dtype=np.float64)
+        self._live_frame_phase_arr=np.full(8192,"",dtype=object)
         self._live_zone_roi_arrs=[]
         self._live_zone_count=0
         self._live_zone_areas=np.array([],dtype=np.float64)
         self._lowess_color=QtGui.QColor(60,220,100)
+        self._live_readout_timer=QtCore.QTimer(self)
+        self._live_readout_timer.setInterval(250)
+        self._live_readout_timer.timeout.connect(
+            lambda:self._update_live_readout(force=True))
+        self._live_readout_start_wall=np.nan
         # Build widgets after all state fields exist; many widget callbacks refer
         # to these fields.
         self._build_ui();self._apply_cmap()
@@ -136,6 +142,7 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
             g=scr.availableGeometry();self.resize(min(w,g.width()),min(h,g.height()))
         else:self.resize(w,h)
         QtCore.QTimer.singleShot(0,self._restore_window_layout)
+        QtCore.QTimer.singleShot(1500,self._start_idle_ocp_monitor)
 
     def _append_console_text(self,text,channel="Status"):
         # Central log for status/progress text that used to live in the right
@@ -246,15 +253,22 @@ class DemoWindow(ImageDisplayMixin, CVPlotMixin, AnalysisMixin, AcquisitionMixin
         self.cmap_cb.addItems(["gray","viridis","plasma","magma","inferno","cividis","turbo","jet"])
         self.cmap_cb.setCurrentText(self.cfg["display"].get("colormap","viridis"))
         self.cmap_cb.currentTextChanged.connect(self._apply_cmap);ctrl.addWidget(self.cmap_cb)
-        ctrl.addWidget(QtWidgets.QLabel("Min:"));self.lmin=QtWidgets.QDoubleSpinBox();self.lmin.setDecimals(2);self.lmin.setRange(-1e30,1e30)
+        ctrl.addWidget(QtWidgets.QLabel("Min:"));self.lmin=QtWidgets.QDoubleSpinBox();self.lmin.setDecimals(6);self.lmin.setRange(-1e30,1e30)
         self.lmin.setFixedWidth(100)
         self.lmin.setValue(float(self.cfg["display"].get("level_min","0")));self.lmin.valueChanged.connect(self._ml);ctrl.addWidget(self.lmin)
-        ctrl.addWidget(QtWidgets.QLabel("Max:"));self.lmax=QtWidgets.QDoubleSpinBox();self.lmax.setDecimals(2);self.lmax.setRange(-1e30,1e30)
+        ctrl.addWidget(QtWidgets.QLabel("Max:"));self.lmax=QtWidgets.QDoubleSpinBox();self.lmax.setDecimals(6);self.lmax.setRange(-1e30,1e30)
         self.lmax.setFixedWidth(100)
         self.lmax.setValue(float(self.cfg["display"].get("level_max","1000")));self.lmax.valueChanged.connect(self._ml);ctrl.addWidget(self.lmax)
         self.auto_lev=QtWidgets.QCheckBox("Auto");self.auto_lev.setChecked(self.cfg["display"].get("auto_levels","true").lower()=="true")
         self.auto_lev.toggled.connect(self._on_auto_lev_toggle)
         ctrl.addWidget(self.auto_lev)
+        self.btn_minmax=QtWidgets.QPushButton("min/max")
+        self.btn_minmax.setEnabled(False)
+        self.btn_minmax.setToolTip(
+            "Use the minimum and maximum image values across the full saved frame stack.\n"
+            "Uses normalized dR/R values when dR/R display is enabled.")
+        self.btn_minmax.clicked.connect(self._on_minmax_levels)
+        ctrl.addWidget(self.btn_minmax)
         ctrl.addWidget(QtWidgets.QLabel("Preview compression:"))
         self.preview_bin_cb=QtWidgets.QComboBox()
         self.preview_bin_cb.addItems(["1x","2x","4x","8x","16x"])

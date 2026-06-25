@@ -93,6 +93,7 @@ class _LiveFrameProcessor(QtCore.QThread):
                     "roi":rv,
                     "roi_by_zone":roi_by_zone,
                     "zone_areas":payload.get("zone_areas",[]),
+                    "phase":payload.get("phase",""),
                     "generation":payload["generation"],
                     "worker_frame_ms":elapsed_ms,
                     "worker_queue_dropped_frames":self._dropped_frames,
@@ -108,6 +109,7 @@ class _LiveFrameProcessor(QtCore.QThread):
                     "roi":np.nan,
                     "roi_by_zone":[],
                     "zone_areas":payload.get("zone_areas",[]),
+                    "phase":payload.get("phase",""),
                     "generation":payload.get("generation",-1),
                     "worker_frame_ms":np.nan,
                     "worker_queue_dropped_frames":self._dropped_frames,
@@ -209,8 +211,8 @@ class AcquisitionMixin:
                 f"font-weight:bold;color:{color};")
 
     def _start_idle_ocp_monitor(self):
-        # After a real acquisition, keep showing the open-circuit potential while
-        # no experiment is running. This uses a worker so the GUI stays fluid.
+        # Keep showing the open-circuit potential while no experiment is
+        # running. This uses a worker so the GUI stays fluid.
         if getattr(self,"_running",False):return
         if getattr(self,"_ocp_worker",None) is not None:return
         try:
@@ -232,6 +234,15 @@ class AcquisitionMixin:
             try:w.wait(1500)
             except Exception:pass
         self._ocp_worker=None
+
+    def _schedule_idle_ocp_monitor(self,delay_ms=1500):
+        # Experiments need exclusive potentiostat access, so the OCP worker is
+        # stopped during acquisition and restarted once the GUI is idle again.
+        if getattr(self,"_running",False):return
+        if getattr(self,"_ocp_worker",None) is not None:return
+        if hasattr(self,"prog_lbl"):
+            self.prog_lbl.setText("Idle OCP monitor starting...")
+        QtCore.QTimer.singleShot(int(delay_ms),self._start_idle_ocp_monitor)
 
     def _on_idle_ocp_finished(self,worker):
         if getattr(self,"_ocp_worker",None) is worker:
@@ -303,10 +314,13 @@ class AcquisitionMixin:
                 "live_hold_lbl","live_cycle_lbl")
         if not all(hasattr(self,name) for name in labels):return
         now=time.time()
-        if not force and now-getattr(self,"_last_live_readout_update",0.0)<0.1:return
+        if not force and now-getattr(self,"_last_live_readout_update",0.0)<0.25:return
         self._last_live_readout_update=now
         elapsed=np.nan
-        if getattr(self,"_t_all",np.array([])).size:
+        start_wall=float(getattr(self,"_live_readout_start_wall",np.nan))
+        if getattr(self,"_running",False) and np.isfinite(start_wall):
+            elapsed=max(0.0,now-start_wall)
+        elif getattr(self,"_t_all",np.array([])).size:
             elapsed=float(self._t_all[-1])
         elif getattr(self,"_live_ftw",[]):
             ftw=np.asarray(self._live_ftw,dtype=np.float64)
@@ -337,11 +351,23 @@ class AcquisitionMixin:
         self.live_hold_lbl.setText(self._live_hold_text())
         self.live_cycle_lbl.setText(self._estimate_live_cycle_text())
 
+    def _start_live_readout_timer(self):
+        self._live_readout_start_wall=time.time()
+        timer=getattr(self,"_live_readout_timer",None)
+        if timer is not None and not timer.isActive():
+            timer.start()
+
+    def _stop_live_readout_timer(self):
+        timer=getattr(self,"_live_readout_timer",None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+
     def _reset_live_readout(self):
         self._last_live_readout_update=0.0
         self._live_phase_arr=np.array([],dtype=object)
         self._live_current_phase=""
         self._live_hold_start_wall=np.nan
+        self._live_readout_start_wall=np.nan
         self._idle_ocp_voltage=np.nan
         self._last_idle_ocp_wall=np.nan
         if hasattr(self,"live_elapsed_lbl"):self.live_elapsed_lbl.setText("0.0 s")
@@ -380,14 +406,19 @@ class AcquisitionMixin:
         # Fill new slots with NaN so missing or unprocessed values are explicit.
         ftw=np.full(new_size,np.nan,dtype=np.float64)
         roi=np.full(new_size,np.nan,dtype=np.float64)
+        phase=np.full(new_size,"",dtype=object)
         ftw[:self._live_ftw_arr.size]=self._live_ftw_arr
         roi[:self._live_roi_arr.size]=self._live_roi_arr
+        old_phase=getattr(self,"_live_frame_phase_arr",np.array([],dtype=object))
+        if old_phase.size:
+            phase[:old_phase.size]=old_phase
         zone_arrs=[]
         for arr in getattr(self,"_live_zone_roi_arrs",[]):
             za=np.full(new_size,np.nan,dtype=np.float64)
             za[:arr.size]=arr
             zone_arrs.append(za)
         self._live_ftw_arr=ftw;self._live_roi_arr=roi
+        self._live_frame_phase_arr=phase
         self._live_zone_roi_arrs=zone_arrs
 
     def _ensure_live_zone_capacity(self,n,n_zones):
@@ -464,6 +495,7 @@ class AcquisitionMixin:
         # Preallocate live preview arrays. They can grow later if needed.
         self._live_ftw_arr=np.full(8192,np.nan,dtype=np.float64)
         self._live_roi_arr=np.full(8192,np.nan,dtype=np.float64)
+        self._live_frame_phase_arr=np.full(8192,"",dtype=object)
         self._live_zone_roi_arrs=[]
         self._live_zone_count=0
         self._live_zone_areas=np.array([],dtype=np.float64)
@@ -484,6 +516,7 @@ class AcquisitionMixin:
         self.cl_overlay.setVisible(False);self.pca_overlay.setVisible(False);self.an_var.setText("")
         self.fslider.setRange(0,0);self.fslider_lbl.setText("0/0")
         self.cv_curve.setData([],[]);self.roi_t_curve.setData([],[]);self.roi_e_curve.setData([],[])
+        if hasattr(self,"_update_minmax_button_state"):self._update_minmax_button_state()
         # Remove per-cycle plot curves that were created dynamically.
         for _attr in ("_cv_cyc_curves","_roi_e_cyc_curves","_roi_e_cyc_lowess",
                       "_roi_t_zone_curves","_roi_t_zone_smooth","_roi_t_zone_lowess",
@@ -551,6 +584,7 @@ class AcquisitionMixin:
         self._clear_test_preview_state()
         self._clear_data();self._running=True;self._set_btns(True);self.traffic.setState(TrafficLight.RED)
         self._auto_analyze_on_done=True
+        self._start_live_readout_timer()
         self._start_frame_processor()
         self.status_lbl.setText("Test...");self.prog_lbl.setText("")
         self._store_dir=tempfile.mkdtemp(prefix="sor_test_")
@@ -568,6 +602,7 @@ class AcquisitionMixin:
         self.btn_load.setEnabled(not running)
         self.btn_analyze.setEnabled(not running)
         if hasattr(self,"btn_ref_capture"):self.btn_ref_capture.setEnabled(not running)
+        if hasattr(self,"_update_minmax_button_state"):self._update_minmax_button_state()
 
     def _set_reference_preview_ui(self,active):
         # Reference preview uses the camera but does not run echem or save
@@ -590,6 +625,7 @@ class AcquisitionMixin:
             self.btn_test.setEnabled(True);self.btn_load.setEnabled(True)
             self.btn_stop.setEnabled(False)
             self.btn_analyze.setEnabled(self._memmap is not None and self._n_frames>0)
+        if hasattr(self,"_update_minmax_button_state"):self._update_minmax_button_state()
 
     def _on_reference_capture(self):
         # First click starts camera-only preview. Second click stores the latest
@@ -688,6 +724,7 @@ class AcquisitionMixin:
         bin_path=os.path.join(save_dir,json_stem+"_frames_raw.bin")
         # Move the GUI into "running" state before starting device work.
         self._clear_data();self._running=True;self._set_btns(True);self.traffic.setState(TrafficLight.RED)
+        self._start_live_readout_timer()
         self._start_frame_processor()
         self.status_lbl.setText(f"Starting {exp}...");self.prog_lbl.setText("")
         self._store_dir=save_dir
@@ -752,6 +789,7 @@ class AcquisitionMixin:
         # Normalize the completed worker payload into the main-window state used
         # by plotting, ROI analysis, PCA/clustering, and export.
         self._stop_frame_processor()
+        self._stop_live_readout_timer()
         # Restore the GUI from "running" mode before updating result widgets.
         self._running=False;self._worker=None;self._set_btns(False)
         self.traffic.setState(TrafficLight.YELLOW)
@@ -783,6 +821,7 @@ class AcquisitionMixin:
                 self.fslider.setValue(self._n_frames-1)
                 self.fslider_lbl.setText(f"{self._n_frames-1}/{self._n_frames-1}")
             except Exception as e:self._memmap=None;self.status_lbl.setText(f"Memmap err: {e}")
+        if hasattr(self,"_update_minmax_button_state"):self._update_minmax_button_state()
         try:
             # Save lightweight metadata so the dataset can be loaded later
             # without rerunning the experiment.
@@ -805,25 +844,24 @@ class AcquisitionMixin:
                     if key in perf:stats[key]=perf[key]
             self._update_perf_panel(force=True)
         self._update_live_readout(force=True)
-        if not getattr(self,"_auto_analyze_on_done",False):
-            if hasattr(self,"prog_lbl"):
-                self.prog_lbl.setText("Idle OCP monitor starting...")
-            QtCore.QTimer.singleShot(1500,self._start_idle_ocp_monitor)
         if getattr(self,"_auto_analyze_on_done",False):
             self._auto_analyze_on_done=False
             self.status_lbl.setText(f"Synthetic test complete. Analyzing {self._n_frames} frames...")
             QtWidgets.QApplication.processEvents()
             self._on_analyze()
+        self._schedule_idle_ocp_monitor()
 
     def _on_err(self,msg):
         # Worker errors arrive here. Reset the GUI and show a concise message.
         self._stop_idle_ocp_monitor()
         self._stop_frame_processor()
+        self._stop_live_readout_timer()
         self._running=False;self._worker=None;self._set_btns(False);self.traffic.setState(TrafficLight.GREEN)
         self._auto_analyze_on_done=False
         self.status_lbl.setText("Error.");QtWidgets.QMessageBox.warning(self,"Error",msg[:1000])
         self._update_perf_panel(force=True)
         self._update_live_readout(force=True)
+        self._schedule_idle_ocp_monitor()
 
     def _on_analyze(self):
         """Run all deferred heavy processing after acquisition completes."""
@@ -897,6 +935,7 @@ class AcquisitionMixin:
                 self.fslider.setRange(0,max(0,self._n_frames-1));self.fslider.setValue(self._n_frames-1)
                 self.fslider_lbl.setText(f"{self._n_frames-1}/{self._n_frames-1}")
             except Exception as e:self._memmap=None;self.status_lbl.setText(f"Memmap err: {e}")
+        if hasattr(self,"_update_minmax_button_state"):self._update_minmax_button_state()
         # Loading should at least refresh the CV plot; ROI and PCA work still
         # happens when the user clicks Analyze.
         self._update_cv()
@@ -934,6 +973,7 @@ class AcquisitionMixin:
         self._clear_data();self._store_dir=store;self._load_ds(ds)
         self.status_lbl.setText(f"Loaded {self._n_frames} frames ({self._frames_dtype}). Click ⚙ Analyze to process.")
         self.btn_analyze.setEnabled(True)
+        self._schedule_idle_ocp_monitor()
 
     def _on_prog(self,pts,frames):
         self.prog_lbl.setText(f"Echem: {pts:,} | Frames: {frames}")
@@ -1009,6 +1049,8 @@ class AcquisitionMixin:
         self._update_live_readout()
         n=fidx+1
         self._ensure_live_capacity(n)
+        if phase:
+            self._live_frame_phase_arr[fidx]=phase
         # Keep the frame slider pinned to the newest frame during acquisition.
         self.fslider.setRange(0,max(0,fidx));self.fslider.setValue(fidx)
         self.fslider_lbl.setText(f"{fidx}/{fidx}")
@@ -1033,6 +1075,7 @@ class AcquisitionMixin:
                 "frame_idx":fidx,
                 "t_wall":tw,
                 "power":pwr,
+                "phase":phase,
                 "generation":self._frame_processor_generation,
             })
         else:
@@ -1045,6 +1088,7 @@ class AcquisitionMixin:
                 "frame_idx":fidx,"t_wall":tw,"power":pwr,"roi":rv,
                 "roi_by_zone":roi_by_zone,
                 "zone_areas":zone_areas,
+                "phase":phase,
                 "generation":self._frame_processor_generation,
                 "worker_frame_ms":np.nan,
                 "worker_queue_dropped_frames":0,
@@ -1061,6 +1105,9 @@ class AcquisitionMixin:
         self._ensure_live_capacity(n)
         self._live_ftw_arr[fidx]=float(data.get("t_wall",np.nan))
         self._live_roi_arr[fidx]=float(data.get("roi",np.nan))
+        phase=str(data.get("phase","") or "")
+        if phase:
+            self._live_frame_phase_arr[fidx]=phase
         roi_by_zone=list(data.get("roi_by_zone",[]) or [])
         zone_areas=np.asarray(data.get("zone_areas",[]),dtype=np.float64)
         if zone_areas.size:
@@ -1127,7 +1174,15 @@ class AcquisitionMixin:
                     and self._live_etw_arr.size>=1 and self._live_eE_arr.size>=1)
         if can_live_e:
             frame_E=_interp_echem(fa,self._live_etw_arr,self._live_eE_arr)
+            e_keep=np.ones(frame_E.size,dtype=bool)
+            phase_arr=np.asarray(getattr(self,"_live_frame_phase_arr",[]),dtype=object)[:frame_E.size]
+            if phase_arr.size==frame_E.size and np.any(phase_arr!=""):
+                e_keep=np.asarray([str(ph)!="hold_init" for ph in phase_arr],dtype=bool)
+            else:
+                start=self._potential_plot_start(frame_E)
+                e_keep=np.arange(frame_E.size)>=start
             E_d=frame_E[idx] if self._live_processed_n>MAX_LIVE else frame_E
+            e_keep_d=e_keep[idx] if self._live_processed_n>MAX_LIVE else e_keep
             live_e_arrs=(self._divide_zone_traces_by_area(live_zone_arrs,live=True)
                          if e_area_mode else live_zone_arrs)
             if live_e_arrs:
@@ -1136,12 +1191,12 @@ class AcquisitionMixin:
                 for z_idx,arr in enumerate(live_e_arrs):
                     za=arr[:self._live_processed_n]
                     za_d=za[idx] if self._live_processed_n>MAX_LIVE else za
-                    m=np.isfinite(E_d)&np.isfinite(za_d)
+                    m=e_keep_d&np.isfinite(E_d)&np.isfinite(za_d)
                     self._roi_e_zone_curves[z_idx].setData(E_d[m],za_d[m])
             else:
                 self._ensure_live_roi_e_curves(0)
                 ra_e_d=(ra_d/self._total_area(live=True) if e_area_mode else ra_d)
-                m=np.isfinite(E_d)&np.isfinite(ra_e_d)
+                m=e_keep_d&np.isfinite(E_d)&np.isfinite(ra_e_d)
                 self.roi_e_curve.setData(E_d[m],ra_e_d[m])
             self.roi_e_plot.setTitle("Reflectance / Area vs Potential" if e_area_mode else "Reflectance vs Potential")
             self.roi_e_plot.setLabel("bottom","Potential (V)")

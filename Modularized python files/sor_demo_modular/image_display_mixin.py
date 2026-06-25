@@ -77,6 +77,145 @@ class ImageDisplayMixin:
         lo,hi=float(self.lmin.value()),float(self.lmax.value())
         if hi>lo:self.img_item.setLevels([lo,hi])
 
+    def _update_minmax_button_state(self):
+        btn=getattr(self,"btn_minmax",None)
+        if btn is None:return
+        ready=(getattr(self,"_memmap",None) is not None
+               and int(getattr(self,"_n_frames",0) or 0)>0
+               and not getattr(self,"_running",False)
+               and not getattr(self,"_ref_preview_active",False))
+        btn.setEnabled(bool(ready))
+
+    def _auto_levels_for_display(self,img):
+        # Match the exact auto-scaling policy used by _show_frame.
+        v=np.asarray(img,dtype=np.float32)
+        v=v[np.isfinite(v)]
+        if v.size==0:return np.nan,np.nan
+        drr_mode=hasattr(self,"btn_drr") and self.btn_drr.isChecked()
+        if drr_mode:
+            bound=float(np.percentile(np.abs(v),98))
+            if bound<1e-10:bound=float(np.max(np.abs(v))) or 1e-6
+            return -bound,bound
+        return float(np.percentile(v,1)),float(np.percentile(v,99))
+
+    def _minmax_chunk_len(self):
+        hw=getattr(self,"_frames_hw",None)
+        if not hw:return 1
+        h,w=hw
+        try:itemsize=np.dtype(getattr(self,"_frames_dtype","float32")).itemsize
+        except Exception:itemsize=4
+        bytes_per_frame=max(1,int(h)*int(w)*itemsize)
+        target_bytes=128*1024*1024
+        return max(1,min(int(getattr(self,"_n_frames",1) or 1),
+                         target_bytes//bytes_per_frame))
+
+    def _rotation_changes_pixel_values(self):
+        if not hasattr(self,"rot_sp"):return False
+        deg=float(self.rot_sp.value())%360
+        return not (abs(deg)<0.05 or abs(deg-90)<0.05
+                    or abs(deg-180)<0.05 or abs(deg-270)<0.05)
+
+    def _drr_reference_frame(self,shape):
+        ref=getattr(self,"_custom_drr_ref_frame",None)
+        if ref is not None:
+            ref=np.asarray(ref,dtype=np.float32)
+        if ref is None or ref.shape!=shape:
+            if self._memmap is None or self._n_frames<1:return None
+            ref=np.asarray(self._memmap[0],dtype=np.float32)
+        return ref if ref.shape==shape else None
+
+    def _stack_auto_levels_fast(self):
+        # Fast equivalent of visiting each frame with Auto on. Percentiles are
+        # unchanged by no rotation or exact 90-degree rotations, so only
+        # arbitrary-angle rotation must use the slower display path.
+        if self._rotation_changes_pixel_values():return None
+        n=int(self._n_frames)
+        if n<=0:return None
+        drr_mode=hasattr(self,"btn_drr") and self.btn_drr.isChecked()
+        chunk_len=min(self._minmax_chunk_len(),100)
+        lo=np.inf;hi=-np.inf
+        if not drr_mode:
+            for i0 in range(0,n,chunk_len):
+                i1=min(n,i0+chunk_len)
+                chunk=np.asarray(self._memmap[i0:i1],dtype=np.float32)
+                chunk=np.where(np.isfinite(chunk),chunk,np.nan)
+                lows=np.nanpercentile(chunk.reshape(chunk.shape[0],-1),1,axis=1)
+                highs=np.nanpercentile(chunk.reshape(chunk.shape[0],-1),99,axis=1)
+                lows=lows[np.isfinite(lows)];highs=highs[np.isfinite(highs)]
+                if lows.size:lo=min(lo,float(np.min(lows)))
+                if highs.size:hi=max(hi,float(np.max(highs)))
+                self._update_minmax_progress(i1,n)
+            return lo,hi
+        mode=self.drr_smooth_cb.currentText() if hasattr(self,"drr_smooth_cb") else "None"
+        if mode!="None":return None
+        ref=self._drr_reference_frame(tuple(getattr(self,"_frames_hw",()) or ()))
+        if ref is None:return None
+        safe_ref=np.where(np.abs(ref)<1e-10,np.ones_like(ref),ref).astype(np.float32)
+        for i0 in range(0,n,chunk_len):
+            i1=min(n,i0+chunk_len)
+            chunk=np.asarray(self._memmap[i0:i1],dtype=np.float32)
+            drr=(chunk-ref[np.newaxis,:,:])/safe_ref[np.newaxis,:,:]
+            abs_drr=np.abs(drr)
+            abs_drr=np.where(np.isfinite(abs_drr),abs_drr,np.nan)
+            bounds=np.nanpercentile(abs_drr.reshape(abs_drr.shape[0],-1),98,axis=1)
+            fallback=np.nanmax(abs_drr.reshape(abs_drr.shape[0],-1),axis=1)
+            bounds=np.where(bounds<1e-10,fallback,bounds)
+            bounds=bounds[np.isfinite(bounds)]
+            if bounds.size:
+                hi=max(hi,float(np.max(bounds)))
+                lo=min(lo,float(-np.max(bounds)))
+            self._update_minmax_progress(i1,n)
+        return lo,hi
+
+    def _update_minmax_progress(self,done,total):
+        if done%100!=0 and done<total:return
+        if hasattr(self,"prog_lbl"):
+            self.prog_lbl.setText(f"Computing auto min/max {done}/{total}")
+        QtWidgets.QApplication.processEvents()
+
+    def _on_minmax_levels(self):
+        # Lock image levels to the full saved frame stack so scrubbing does not
+        # re-grade each frame independently.
+        if self._memmap is None or self._n_frames<=0:
+            QtWidgets.QMessageBox.information(self,"Min/max","No completed frame stack is available.")
+            self._update_minmax_button_state()
+            return
+        btn=getattr(self,"btn_minmax",None)
+        if btn is not None:btn.setEnabled(False)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        lo=np.inf;hi=-np.inf
+        try:
+            drr_mode=hasattr(self,"btn_drr") and self.btn_drr.isChecked()
+            fast_levels=self._stack_auto_levels_fast()
+            if fast_levels is not None:
+                lo,hi=fast_levels
+            else:
+                for i in range(int(self._n_frames)):
+                    frame=np.asarray(self._memmap[i],dtype=np.float32)
+                    display=self._get_display_frame(frame)
+                    c_lo,c_hi=self._auto_levels_for_display(display)
+                    if np.isfinite(c_lo):lo=min(lo,float(c_lo))
+                    if np.isfinite(c_hi):hi=max(hi,float(c_hi))
+                    self._update_minmax_progress(i+1,int(self._n_frames))
+            if not np.isfinite(lo) or not np.isfinite(hi):
+                QtWidgets.QMessageBox.information(self,"Min/max","No finite image values were found.")
+                return
+            if hi<=lo:
+                pad=max(abs(lo)*1e-6,1e-6)
+                lo-=pad;hi+=pad
+            if self.auto_lev.isChecked():
+                self.auto_lev.setChecked(False)
+            self.lmin.blockSignals(True);self.lmax.blockSignals(True)
+            self.lmin.setValue(lo);self.lmax.setValue(hi)
+            self.lmin.blockSignals(False);self.lmax.blockSignals(False)
+            self._ml()
+            mode="dR/R" if drr_mode else "reflectance"
+            if hasattr(self,"prog_lbl"):
+                self.prog_lbl.setText(f"Locked {mode} levels to full-stack min/max: {lo:.6g} to {hi:.6g}")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self._update_minmax_button_state()
+
     def _get_display_frame(self,frame):
         # This affects only the image shown in the GUI. It does not modify the
         # saved raw frames or the analysis data.
@@ -308,22 +447,12 @@ class ImageDisplayMixin:
         self.img_item.setImage(shown,autoLevels=False)
         self._set_image_rect(display_hw if preview_downsample else shown.shape[:2])
         if self.auto_lev.isChecked():
-            v=shown[np.isfinite(shown)]
-            if v.size>0:
-                drr_mode=hasattr(self,"btn_drr") and self.btn_drr.isChecked()
-                if drr_mode:
-                    # dR/R benefits from symmetric color limits around zero so
-                    # positive and negative changes are visually balanced.
-                    bound=float(np.percentile(np.abs(v),98))
-                    if bound<1e-10:bound=float(np.max(np.abs(v))) or 1e-6
-                    lo=-bound;hi=bound
-                else:
-                    lo=float(np.percentile(v,1));hi=float(np.percentile(v,99))
-                if np.isfinite(lo) and np.isfinite(hi) and hi>lo:
-                    self.img_item.setLevels([lo,hi])
-                    self.lmin.blockSignals(True);self.lmax.blockSignals(True)
-                    self.lmin.setValue(lo);self.lmax.setValue(hi)
-                    self.lmin.blockSignals(False);self.lmax.blockSignals(False)
+            lo,hi=self._auto_levels_for_display(shown)
+            if np.isfinite(lo) and np.isfinite(hi) and hi>lo:
+                self.img_item.setLevels([lo,hi])
+                self.lmin.blockSignals(True);self.lmax.blockSignals(True)
+                self.lmin.setValue(lo);self.lmax.setValue(hi)
+                self.lmin.blockSignals(False);self.lmax.blockSignals(False)
         else:self._ml()
 
     def _on_preview_bin_changed(self,*_):
